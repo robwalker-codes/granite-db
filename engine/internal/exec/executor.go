@@ -2,6 +2,7 @@ package exec
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -124,20 +125,65 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
 	}
 	heap := storage.NewHeapFile(e.storage, table.RootPage)
-	rows := [][]string{}
+	ctx := newEvalContext(table.Columns)
+	valuesRows := make([][]interface{}, 0)
 	if err := heap.Scan(func(record []byte) error {
 		values, err := DecodeRow(table.Columns, record)
 		if err != nil {
 			return err
 		}
-		display := make([]string, len(values))
-		for i, v := range values {
-			display[i] = formatValue(table.Columns[i], v)
+		ctx.setValues(values)
+		truth, err := ctx.eval(stmt.Where)
+		if err != nil {
+			return err
 		}
-		rows = append(rows, display)
+		if truth != truthTrue {
+			return nil
+		}
+		clone := make([]interface{}, len(values))
+		copy(clone, values)
+		valuesRows = append(valuesRows, clone)
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if stmt.OrderBy != nil {
+		idx, ok := ctx.index[strings.ToLower(stmt.OrderBy.Column)]
+		if !ok {
+			return nil, fmt.Errorf("exec: unknown column %s in ORDER BY", stmt.OrderBy.Column)
+		}
+		column := table.Columns[idx]
+		sort.SliceStable(valuesRows, func(i, j int) bool {
+			left := valuesRows[i][idx]
+			right := valuesRows[j][idx]
+			cmp := orderCompare(column, left, right)
+			if stmt.OrderBy.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		})
+	}
+	if stmt.Limit != nil {
+		offset := stmt.Limit.Offset
+		if offset < 0 {
+			offset = 0
+		}
+		if offset >= len(valuesRows) {
+			valuesRows = [][]interface{}{}
+		} else {
+			valuesRows = valuesRows[offset:]
+			if stmt.Limit.Limit < len(valuesRows) {
+				valuesRows = valuesRows[:stmt.Limit.Limit]
+			}
+		}
+	}
+	rows := make([][]string, len(valuesRows))
+	for i, values := range valuesRows {
+		display := make([]string, len(values))
+		for j, v := range values {
+			display[j] = formatValue(table.Columns[j], v)
+		}
+		rows[i] = display
 	}
 	columns := make([]string, len(table.Columns))
 	for i, col := range table.Columns {
@@ -224,6 +270,9 @@ func convertLiteral(lit parser.Literal, col catalog.Column) (interface{}, error)
 }
 
 func formatValue(col catalog.Column, value interface{}) string {
+	if value == nil {
+		return "NULL"
+	}
 	switch col.Type {
 	case catalog.ColumnTypeInt:
 		return fmt.Sprintf("%d", value.(int32))

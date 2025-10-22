@@ -20,6 +20,12 @@ const (
 	RParen
 	Semicolon
 	Star
+	Equal
+	NotEqual
+	Less
+	LessEqual
+	Greater
+	GreaterEqual
 )
 
 // Token represents a lexical item.
@@ -49,6 +55,16 @@ var keywords = map[string]TokenType{
 	"TIMESTAMP": Ident,
 	"TRUE":      Ident,
 	"FALSE":     Ident,
+	"WHERE":     Ident,
+	"AND":       Ident,
+	"OR":        Ident,
+	"ORDER":     Ident,
+	"BY":        Ident,
+	"ASC":       Ident,
+	"DESC":      Ident,
+	"LIMIT":     Ident,
+	"OFFSET":    Ident,
+	"IS":        Ident,
 }
 
 // Lexer performs tokenisation over the input SQL string.
@@ -86,6 +102,29 @@ func (l *Lexer) Next() Token {
 	case '*':
 		l.pos++
 		return Token{Type: Star, Literal: "*"}
+	case '=':
+		l.pos++
+		return Token{Type: Equal, Literal: "="}
+	case '<':
+		l.pos++
+		if l.pos < len(l.input) {
+			switch l.input[l.pos] {
+			case '=':
+				l.pos++
+				return Token{Type: LessEqual, Literal: "<="}
+			case '>':
+				l.pos++
+				return Token{Type: NotEqual, Literal: "<>"}
+			}
+		}
+		return Token{Type: Less, Literal: "<"}
+	case '>':
+		l.pos++
+		if l.pos < len(l.input) && l.input[l.pos] == '=' {
+			l.pos++
+			return Token{Type: GreaterEqual, Literal: ">="}
+		}
+		return Token{Type: Greater, Literal: ">"}
 	case '\'', '"':
 		return l.scanString(ch)
 	}
