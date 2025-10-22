@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -24,6 +27,8 @@ func main() {
 		runExec(os.Args[2:])
 	case "dump":
 		runDump(os.Args[2:])
+	case "explain":
+		runExplain(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
@@ -35,8 +40,9 @@ func usage() {
 	fmt.Println("GraniteDB control utility")
 	fmt.Println("Usage:")
 	fmt.Println("  granitectl new <dbfile>")
-	fmt.Println("  granitectl exec -q <SQL> <dbfile>")
+	fmt.Println("  granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv] [--continue-on-error] <dbfile>")
 	fmt.Println("  granitectl dump <dbfile>")
+	fmt.Println("  granitectl explain -q <SQL> <dbfile>")
 }
 
 func runNew(args []string) {
@@ -60,16 +66,23 @@ func runNew(args []string) {
 func runExec(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	query := fs.String("q", "", "SQL query to execute")
+	script := fs.String("f", "", "Path to SQL script file")
+	format := fs.String("format", "table", "Output format: table or csv")
+	continueOnError := fs.Bool("continue-on-error", false, "Continue script execution after errors")
 	fs.Usage = func() {
-		fmt.Println("Usage: granitectl exec -q <SQL> <dbfile>")
+		fmt.Println("Usage: granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv] [--continue-on-error] <dbfile>")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		fs.Usage()
 		os.Exit(1)
 	}
-	if *query == "" {
-		fmt.Fprintln(os.Stderr, "error: -q is required")
+	if (*query == "" && *script == "") || (*query != "" && *script != "") {
+		fmt.Fprintln(os.Stderr, "error: either -q or -f must be provided")
+		os.Exit(1)
+	}
+	if err := validateFormat(*format); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 	db, err := api.Open(fs.Arg(0))
@@ -79,12 +92,23 @@ func runExec(args []string) {
 	}
 	defer db.Close()
 
-	result, err := db.Execute(*query)
-	if err != nil {
+	if *query != "" {
+		result, err := db.Execute(*query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := renderResult(os.Stdout, result, *format); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := execScript(db, *script, *format, *continueOnError); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	renderResult(result)
 }
 
 func runDump(args []string) {
@@ -129,6 +153,40 @@ func runDump(args []string) {
 	}
 }
 
+func runExplain(args []string) {
+	fs := flag.NewFlagSet("explain", flag.ExitOnError)
+	query := fs.String("q", "", "SQL query to explain")
+	fs.Usage = func() {
+		fmt.Println("Usage: granitectl explain -q <SQL> <dbfile>")
+	}
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *query == "" {
+		fmt.Fprintln(os.Stderr, "error: -q is required")
+		os.Exit(1)
+	}
+	db, err := api.Open(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	plan, err := db.Explain(*query)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	prettyPrintPlan(plan.Root, 0)
+	if err := renderPlanJSON(plan); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func describeType(col catalog.Column) string {
 	switch col.Type {
 	case catalog.ColumnTypeInt:
@@ -148,9 +206,21 @@ func describeType(col catalog.Column) string {
 	}
 }
 
-func renderResult(res *exec.Result) {
+func renderResult(w io.Writer, res *exec.Result, format string) error {
+	switch format {
+	case "table":
+		renderTable(w, res)
+		return nil
+	case "csv":
+		return renderCSV(w, res)
+	default:
+		return fmt.Errorf("unsupported format %s", format)
+	}
+}
+
+func renderTable(w io.Writer, res *exec.Result) {
 	if len(res.Columns) == 0 {
-		fmt.Println(res.Message)
+		fmt.Fprintln(w, res.Message)
 		return
 	}
 	widths := make([]int, len(res.Columns))
@@ -164,22 +234,121 @@ func renderResult(res *exec.Result) {
 			}
 		}
 	}
-	printRow(res.Columns, widths)
+	printRow(w, res.Columns, widths)
 	separator := make([]string, len(widths))
 	for i, w := range widths {
 		separator[i] = strings.Repeat("-", w)
 	}
-	printRow(separator, widths)
+	printRow(w, separator, widths)
 	for _, row := range res.Rows {
-		printRow(row, widths)
+		printRow(w, row, widths)
 	}
-	fmt.Printf("(%d row(s))\n", len(res.Rows))
+	fmt.Fprintf(w, "(%d row(s))\n", len(res.Rows))
 }
 
-func printRow(values []string, widths []int) {
+func renderCSV(w io.Writer, res *exec.Result) error {
+	writer := csv.NewWriter(w)
+	if len(res.Columns) > 0 {
+		if err := writer.Write(res.Columns); err != nil {
+			return err
+		}
+	}
+	for _, row := range res.Rows {
+		if err := writer.Write(row); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
+	}
+	if len(res.Columns) == 0 {
+		fmt.Fprintln(w, res.Message)
+	}
+	return nil
+}
+
+func printRow(w io.Writer, values []string, widths []int) {
 	cells := make([]string, len(values))
 	for i, v := range values {
 		cells[i] = fmt.Sprintf("%-*s", widths[i], v)
 	}
-	fmt.Println(strings.Join(cells, " | "))
+	fmt.Fprintln(w, strings.Join(cells, " | "))
+}
+
+func validateFormat(format string) error {
+	switch format {
+	case "table", "csv":
+		return nil
+	default:
+		return fmt.Errorf("unknown format %s", format)
+	}
+}
+
+func execScript(db *api.Database, path, format string, continueOnError bool) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	statements := splitStatements(string(content))
+	var combinedErr error
+	for _, stmt := range statements {
+		res, err := db.Execute(stmt)
+		if err != nil {
+			if continueOnError {
+				fmt.Fprintf(os.Stderr, "error executing %q: %v\n", stmt, err)
+				combinedErr = err
+				continue
+			}
+			return fmt.Errorf("statement %q failed: %w", stmt, err)
+		}
+		if err := renderResult(os.Stdout, res, format); err != nil {
+			return err
+		}
+	}
+	if combinedErr != nil {
+		return fmt.Errorf("one or more statements failed; see above")
+	}
+	return nil
+}
+
+func splitStatements(script string) []string {
+	parts := strings.Split(script, ";")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func prettyPrintPlan(node *exec.PlanNode, depth int) {
+	if node == nil {
+		return
+	}
+	indent := strings.Repeat("  ", depth)
+	fmt.Printf("%s- %s", indent, node.Name)
+	if len(node.Detail) > 0 {
+		fmt.Printf(" %v", node.Detail)
+	}
+	fmt.Println()
+	for _, child := range node.Children {
+		prettyPrintPlan(child, depth+1)
+	}
+}
+
+func renderPlanJSON(plan *exec.Plan) error {
+	if plan == nil {
+		return fmt.Errorf("no plan to render")
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("\nPlan JSON:")
+	fmt.Println(string(data))
+	return nil
 }

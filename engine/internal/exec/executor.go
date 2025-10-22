@@ -47,6 +47,28 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 	}
 }
 
+// Explain builds a lightweight logical description of how the statement would
+// execute. The implementation is deliberately simple but offers callers a
+// stable JSON structure for tooling to consume.
+func (e *Executor) Explain(stmt parser.Statement) (*Plan, error) {
+	switch s := stmt.(type) {
+	case *parser.CreateTableStmt:
+		return newPlan("CreateTable", map[string]interface{}{"table": s.Name}), nil
+	case *parser.DropTableStmt:
+		return newPlan("DropTable", map[string]interface{}{"table": s.Name}), nil
+	case *parser.InsertStmt:
+		node := &PlanNode{
+			Name:   "Insert",
+			Detail: map[string]interface{}{"table": s.Table, "columns": s.Columns},
+		}
+		return &Plan{Root: node}, nil
+	case *parser.SelectStmt:
+		return e.explainSelect(s)
+	default:
+		return nil, fmt.Errorf("exec: unsupported statement type %T", stmt)
+	}
+}
+
 func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, error) {
 	if len(stmt.Columns) == 0 {
 		return nil, fmt.Errorf("exec: CREATE TABLE requires at least one column")
@@ -190,6 +212,25 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		columns[i] = col.Name
 	}
 	return &Result{Columns: columns, Rows: rows, RowsAffected: len(rows), Message: fmt.Sprintf("%d row(s)", len(rows))}, nil
+}
+
+func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
+	table, ok := e.catalog.GetTable(stmt.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+	}
+	detail := map[string]interface{}{"table": table.Name}
+	root := &PlanNode{Name: "SeqScan", Detail: detail}
+	if stmt.Where != nil {
+		root.Children = append(root.Children, &PlanNode{Name: "Filter"})
+	}
+	if stmt.OrderBy != nil {
+		root.Children = append(root.Children, &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": stmt.OrderBy.Column, "desc": stmt.OrderBy.Desc}})
+	}
+	if stmt.Limit != nil {
+		root.Children = append(root.Children, &PlanNode{Name: "Limit", Detail: map[string]interface{}{"limit": stmt.Limit.Limit, "offset": stmt.Limit.Offset}})
+	}
+	return &Plan{Root: root}, nil
 }
 
 func convertType(dt parser.DataType) catalog.ColumnType {
