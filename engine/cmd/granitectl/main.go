@@ -35,7 +35,7 @@ func usage() {
 	fmt.Println("GraniteDB control utility")
 	fmt.Println("Usage:")
 	fmt.Println("  granitectl new <dbfile>")
-	fmt.Println("  granitectl exec <dbfile> -q <SQL>")
+	fmt.Println("  granitectl exec -q <SQL> <dbfile>")
 	fmt.Println("  granitectl dump <dbfile>")
 }
 
@@ -61,7 +61,7 @@ func runExec(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	query := fs.String("q", "", "SQL query to execute")
 	fs.Usage = func() {
-		fmt.Println("Usage: granitectl exec <dbfile> -q <SQL>")
+		fmt.Println("Usage: granitectl exec -q <SQL> <dbfile>")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 1 {
