@@ -36,7 +36,11 @@ type Column struct {
 }
 
 const maxColumnLength = 0xFFFF
-const indexSectionMarker uint16 = 0xFFFF
+
+const (
+	indexSectionMarker      uint16 = 0xFFFF
+	foreignKeySectionMarker uint16 = 0xFFFE
+)
 
 func encodeColumnMetadata(col Column) (uint16, error) {
 	switch col.Type {
@@ -95,13 +99,34 @@ func decodeColumnMetadata(colType ColumnType, raw uint16) (length int, precision
 	}
 }
 
+// ForeignKeyAction identifies supported referential behaviours.
+type ForeignKeyAction uint8
+
+const (
+	ForeignKeyActionRestrict ForeignKeyAction = iota
+	ForeignKeyActionNoAction
+)
+
+// ForeignKey describes a child-to-parent relationship between tables.
+type ForeignKey struct {
+	Name          string
+	ChildColumns  []string
+	ParentTable   string
+	ParentColumns []string
+	OnDelete      ForeignKeyAction
+	OnUpdate      ForeignKeyAction
+	Deferrable    bool
+	Valid         bool
+}
+
 // Table captures metadata for a user table.
 type Table struct {
-	Name     string
-	Columns  []Column
-	RootPage storage.PageID
-	RowCount uint64
-	Indexes  map[string]*Index
+	Name        string
+	Columns     []Column
+	RootPage    storage.PageID
+	RowCount    uint64
+	Indexes     map[string]*Index
+	ForeignKeys map[string]*ForeignKey
 }
 
 // Index describes a secondary index definition.
@@ -193,13 +218,17 @@ func Load(mgr *storage.Manager) (*Catalog, error) {
 			cols[primaryIndex].PrimaryKey = true
 		}
 		table := &Table{
-			Name:     name,
-			Columns:  cols,
-			RootPage: storage.PageID(rootPage),
-			RowCount: rowCount,
-			Indexes:  make(map[string]*Index),
+			Name:        name,
+			Columns:     cols,
+			RootPage:    storage.PageID(rootPage),
+			RowCount:    rowCount,
+			Indexes:     make(map[string]*Index),
+			ForeignKeys: make(map[string]*ForeignKey),
 		}
 		if err := readIndexMetadata(reader, table); err != nil {
+			return nil, err
+		}
+		if err := readForeignKeyMetadata(reader, table); err != nil {
 			return nil, err
 		}
 		cat.tables[strings.ToLower(name)] = table
@@ -241,6 +270,9 @@ func readIndexMetadata(r *bytes.Reader, table *Table) error {
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 		return err
 	}
+	if table.Indexes == nil {
+		table.Indexes = make(map[string]*Index)
+	}
 	for i := uint16(0); i < count; i++ {
 		name, err := readString(r)
 		if err != nil {
@@ -263,6 +295,94 @@ func readIndexMetadata(r *bytes.Reader, table *Table) error {
 			cols[j] = colName
 		}
 		table.Indexes[strings.ToLower(name)] = &Index{Name: name, Columns: cols, IsUnique: unique == 1}
+	}
+	return nil
+}
+
+func readForeignKeyMetadata(r *bytes.Reader, table *Table) error {
+	pos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	var marker uint16
+	if err := binary.Read(r, binary.LittleEndian, &marker); err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+	if marker != foreignKeySectionMarker {
+		if _, err := r.Seek(pos, io.SeekStart); err != nil {
+			return err
+		}
+		return nil
+	}
+	var count uint16
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return err
+	}
+	if table.ForeignKeys == nil {
+		table.ForeignKeys = make(map[string]*ForeignKey)
+	}
+	for i := uint16(0); i < count; i++ {
+		name, err := readString(r)
+		if err != nil {
+			return err
+		}
+		parentTable, err := readString(r)
+		if err != nil {
+			return err
+		}
+		var childCount uint16
+		if err := binary.Read(r, binary.LittleEndian, &childCount); err != nil {
+			return err
+		}
+		childCols := make([]string, childCount)
+		for j := uint16(0); j < childCount; j++ {
+			colName, err := readString(r)
+			if err != nil {
+				return err
+			}
+			childCols[j] = colName
+		}
+		var parentCount uint16
+		if err := binary.Read(r, binary.LittleEndian, &parentCount); err != nil {
+			return err
+		}
+		parentCols := make([]string, parentCount)
+		for j := uint16(0); j < parentCount; j++ {
+			colName, err := readString(r)
+			if err != nil {
+				return err
+			}
+			parentCols[j] = colName
+		}
+		var onDelete uint8
+		if err := binary.Read(r, binary.LittleEndian, &onDelete); err != nil {
+			return err
+		}
+		var onUpdate uint8
+		if err := binary.Read(r, binary.LittleEndian, &onUpdate); err != nil {
+			return err
+		}
+		var deferrable uint8
+		if err := binary.Read(r, binary.LittleEndian, &deferrable); err != nil {
+			return err
+		}
+		var valid uint8
+		if err := binary.Read(r, binary.LittleEndian, &valid); err != nil {
+			return err
+		}
+		table.ForeignKeys[strings.ToLower(name)] = &ForeignKey{
+			Name:          name,
+			ChildColumns:  childCols,
+			ParentTable:   parentTable,
+			ParentColumns: parentCols,
+			OnDelete:      ForeignKeyAction(onDelete),
+			OnUpdate:      ForeignKeyAction(onUpdate),
+			Deferrable:    deferrable == 1,
+			Valid:         valid == 1,
+		}
 	}
 	return nil
 }
@@ -319,6 +439,76 @@ func writeIndexMetadata(buf *bytes.Buffer, table *Table) error {
 			if err := writeString(buf, col); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func writeForeignKeyMetadata(buf *bytes.Buffer, table *Table) error {
+	if err := binary.Write(buf, binary.LittleEndian, foreignKeySectionMarker); err != nil {
+		return err
+	}
+	count := uint16(0)
+	if table.ForeignKeys != nil {
+		count = uint16(len(table.ForeignKeys))
+	}
+	if err := binary.Write(buf, binary.LittleEndian, count); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(table.ForeignKeys))
+	for _, fk := range table.ForeignKeys {
+		names = append(names, fk.Name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fk := table.ForeignKeys[strings.ToLower(name)]
+		if fk == nil {
+			continue
+		}
+		if err := writeString(buf, fk.Name); err != nil {
+			return err
+		}
+		if err := writeString(buf, fk.ParentTable); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint16(len(fk.ChildColumns))); err != nil {
+			return err
+		}
+		for _, col := range fk.ChildColumns {
+			if err := writeString(buf, col); err != nil {
+				return err
+			}
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint16(len(fk.ParentColumns))); err != nil {
+			return err
+		}
+		for _, col := range fk.ParentColumns {
+			if err := writeString(buf, col); err != nil {
+				return err
+			}
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint8(fk.OnDelete)); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.LittleEndian, uint8(fk.OnUpdate)); err != nil {
+			return err
+		}
+		var def uint8
+		if fk.Deferrable {
+			def = 1
+		}
+		if err := binary.Write(buf, binary.LittleEndian, def); err != nil {
+			return err
+		}
+		var valid uint8
+		if fk.Valid {
+			valid = 1
+		}
+		if err := binary.Write(buf, binary.LittleEndian, valid); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -384,12 +574,15 @@ func (c *Catalog) persist() error {
 		if err := writeIndexMetadata(buf, table); err != nil {
 			return err
 		}
+		if err := writeForeignKeyMetadata(buf, table); err != nil {
+			return err
+		}
 	}
 	return c.storage.UpdateCatalog(buf.Bytes())
 }
 
 // CreateTable registers a new table and allocates its first heap page.
-func (c *Catalog) CreateTable(name string, columns []Column, primaryKey string) (*Table, error) {
+func (c *Catalog) CreateTable(name string, columns []Column, primaryKey string, foreignKeys []*ForeignKey) (*Table, error) {
 	if name == "" {
 		return nil, fmt.Errorf("catalog: table name required")
 	}
@@ -428,11 +621,31 @@ func (c *Catalog) CreateTable(name string, columns []Column, primaryKey string) 
 		return nil, err
 	}
 	table := &Table{
-		Name:     name,
-		Columns:  cols,
-		RootPage: rootID,
-		RowCount: 0,
-		Indexes:  make(map[string]*Index),
+		Name:        name,
+		Columns:     cols,
+		RootPage:    rootID,
+		RowCount:    0,
+		Indexes:     make(map[string]*Index),
+		ForeignKeys: make(map[string]*ForeignKey),
+	}
+	for _, fk := range foreignKeys {
+		if fk == nil {
+			continue
+		}
+		childCols := make([]string, len(fk.ChildColumns))
+		copy(childCols, fk.ChildColumns)
+		parentCols := make([]string, len(fk.ParentColumns))
+		copy(parentCols, fk.ParentColumns)
+		table.ForeignKeys[strings.ToLower(fk.Name)] = &ForeignKey{
+			Name:          fk.Name,
+			ChildColumns:  childCols,
+			ParentTable:   fk.ParentTable,
+			ParentColumns: parentCols,
+			OnDelete:      fk.OnDelete,
+			OnUpdate:      fk.OnUpdate,
+			Deferrable:    fk.Deferrable,
+			Valid:         fk.Valid,
+		}
 	}
 	c.tables[lower] = table
 	if err := c.persist(); err != nil {
@@ -448,6 +661,16 @@ func (c *Catalog) DropTable(name string) error {
 	table, ok := c.tables[lower]
 	if !ok {
 		return fmt.Errorf("catalog: table %s does not exist", name)
+	}
+	for key, other := range c.tables {
+		if key == lower {
+			continue
+		}
+		for _, fk := range other.ForeignKeys {
+			if strings.EqualFold(fk.ParentTable, table.Name) {
+				return fmt.Errorf("catalog: table %s is referenced by foreign key %s on table %s", table.Name, fk.Name, other.Name)
+			}
+		}
 	}
 	heap := storage.NewHeapFile(c.storage, table.RootPage)
 	pages, err := heap.Pages()
@@ -489,12 +712,32 @@ func (c *Catalog) ListTables() []*Table {
 				copyIdx[key] = &Index{Name: idx.Name, Columns: cols, IsUnique: idx.IsUnique}
 			}
 		}
+		copyFks := make(map[string]*ForeignKey, len(table.ForeignKeys))
+		if len(table.ForeignKeys) > 0 {
+			for key, fk := range table.ForeignKeys {
+				childCols := make([]string, len(fk.ChildColumns))
+				copy(childCols, fk.ChildColumns)
+				parentCols := make([]string, len(fk.ParentColumns))
+				copy(parentCols, fk.ParentColumns)
+				copyFks[key] = &ForeignKey{
+					Name:          fk.Name,
+					ChildColumns:  childCols,
+					ParentTable:   fk.ParentTable,
+					ParentColumns: parentCols,
+					OnDelete:      fk.OnDelete,
+					OnUpdate:      fk.OnUpdate,
+					Deferrable:    fk.Deferrable,
+					Valid:         fk.Valid,
+				}
+			}
+		}
 		result = append(result, &Table{
-			Name:     table.Name,
-			Columns:  copyCols,
-			RootPage: table.RootPage,
-			RowCount: table.RowCount,
-			Indexes:  copyIdx,
+			Name:        table.Name,
+			Columns:     copyCols,
+			RootPage:    table.RootPage,
+			RowCount:    table.RowCount,
+			Indexes:     copyIdx,
+			ForeignKeys: copyFks,
 		})
 	}
 	return result
@@ -585,6 +828,41 @@ func (c *Catalog) TableIndexes(tableName string) []*Index {
 	return result
 }
 
+// TableForeignKeys returns copies of the foreign key definitions for the specified table.
+func (c *Catalog) TableForeignKeys(tableName string) []*ForeignKey {
+	table, ok := c.tables[strings.ToLower(tableName)]
+	if !ok || len(table.ForeignKeys) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(table.ForeignKeys))
+	for _, fk := range table.ForeignKeys {
+		names = append(names, fk.Name)
+	}
+	sort.Strings(names)
+	result := make([]*ForeignKey, 0, len(names))
+	for _, name := range names {
+		fk := table.ForeignKeys[strings.ToLower(name)]
+		if fk == nil {
+			continue
+		}
+		childCols := make([]string, len(fk.ChildColumns))
+		copy(childCols, fk.ChildColumns)
+		parentCols := make([]string, len(fk.ParentColumns))
+		copy(parentCols, fk.ParentColumns)
+		result = append(result, &ForeignKey{
+			Name:          fk.Name,
+			ChildColumns:  childCols,
+			ParentTable:   fk.ParentTable,
+			ParentColumns: parentCols,
+			OnDelete:      fk.OnDelete,
+			OnUpdate:      fk.OnUpdate,
+			Deferrable:    fk.Deferrable,
+			Valid:         fk.Valid,
+		})
+	}
+	return result
+}
+
 // IncrementRowCount increases the stored row count for the table.
 func (c *Catalog) IncrementRowCount(name string) error {
 	table, ok := c.tables[strings.ToLower(name)]
@@ -592,6 +870,18 @@ func (c *Catalog) IncrementRowCount(name string) error {
 		return fmt.Errorf("catalog: table %s not found", name)
 	}
 	table.RowCount++
+	return c.persist()
+}
+
+// DecrementRowCount decreases the stored row count for the table.
+func (c *Catalog) DecrementRowCount(name string) error {
+	table, ok := c.tables[strings.ToLower(name)]
+	if !ok {
+		return fmt.Errorf("catalog: table %s not found", name)
+	}
+	if table.RowCount > 0 {
+		table.RowCount--
+	}
 	return c.persist()
 }
 

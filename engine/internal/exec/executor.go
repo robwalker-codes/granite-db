@@ -1,21 +1,22 @@
 package exec
 
 import (
-        "fmt"
-        "math/big"
-        "sort"
-        "strconv"
-        "strings"
-        "time"
+	"errors"
+	"fmt"
+	"math/big"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
-        "github.com/shopspring/decimal"
+	"github.com/shopspring/decimal"
 
-        "github.com/example/granite-db/engine/internal/catalog"
-        "github.com/example/granite-db/engine/internal/sql/expr"
-        "github.com/example/granite-db/engine/internal/sql/parser"
-        "github.com/example/granite-db/engine/internal/sql/validator"
-        "github.com/example/granite-db/engine/internal/storage"
-        "github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/catalog"
+	"github.com/example/granite-db/engine/internal/sql/expr"
+	"github.com/example/granite-db/engine/internal/sql/parser"
+	"github.com/example/granite-db/engine/internal/sql/validator"
+	"github.com/example/granite-db/engine/internal/storage"
+	"github.com/example/granite-db/engine/internal/storage/indexmgr"
 )
 
 // Result describes the outcome of executing a SQL statement.
@@ -28,57 +29,80 @@ type Result struct {
 
 // Executor evaluates parsed statements against the storage layer.
 type Executor struct {
-        catalog *catalog.Catalog
-        storage *storage.Manager
-        indexes *indexmgr.Manager
+	catalog *catalog.Catalog
+	storage *storage.Manager
+	indexes *indexmgr.Manager
 }
 
 type indexInfo struct {
-        def       *catalog.Index
-        positions []int
+	def       *catalog.Index
+	positions []int
 }
 
 type indexChoice struct {
-        source          *validator.TableSource
-        info            indexInfo
-        prefix          [][]byte
-        lower           []byte
-        lowerInclusive  bool
-        upper           []byte
-        upperInclusive  bool
-        lowerValue      interface{}
-        upperValue      interface{}
+	source         *validator.TableSource
+	info           indexInfo
+	prefix         [][]byte
+	lower          []byte
+	lowerInclusive bool
+	upper          []byte
+	upperInclusive bool
+	lowerValue     interface{}
+	upperValue     interface{}
 }
 
 type columnRestriction struct {
-        eqValue        interface{}
-        lowerValue     interface{}
-        lowerInclusive bool
-        upperValue     interface{}
-        upperInclusive bool
+	eqValue        interface{}
+	lowerValue     interface{}
+	lowerInclusive bool
+	upperValue     interface{}
+	upperInclusive bool
 }
+
+type foreignKeyInfo struct {
+	def             *catalog.ForeignKey
+	childPositions  []int
+	parentTable     *catalog.Table
+	parentPositions []int
+	parentIndex     *catalog.Index
+	childIndex      *catalog.Index
+}
+
+type referencingForeignKey struct {
+	table           *catalog.Table
+	def             *catalog.ForeignKey
+	childPositions  []int
+	childIndex      *catalog.Index
+	parentPositions []int
+}
+
+var errStopScan = errors.New("stop scan")
 
 // New creates an executor for the given catalog and storage manager.
 func New(cat *catalog.Catalog, mgr *storage.Manager, idx *indexmgr.Manager) *Executor {
-        return &Executor{catalog: cat, storage: mgr, indexes: idx}
+	return &Executor{catalog: cat, storage: mgr, indexes: idx}
 }
 
 // Execute runs the provided AST statement and returns a result summary.
 func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
-        switch s := stmt.(type) {
-        case *parser.CreateTableStmt:
-                return e.executeCreateTable(s)
-        case *parser.DropTableStmt:
-                return e.executeDropTable(s)
-        case *parser.CreateIndexStmt:
-                return e.executeCreateIndex(s)
-        case *parser.DropIndexStmt:
-                return e.executeDropIndex(s)
-        case *parser.InsertStmt:
-                return e.executeInsert(s)
-        case *parser.SelectStmt:
-                return e.executeSelect(s)
-        default:
+	switch s := stmt.(type) {
+	case *parser.CreateTableStmt:
+		return e.executeCreateTable(s)
+	case *parser.DropTableStmt:
+		return e.executeDropTable(s)
+	case *parser.CreateIndexStmt:
+		return e.executeCreateIndex(s)
+	case *parser.DropIndexStmt:
+		return e.executeDropIndex(s)
+	case *parser.InsertStmt:
+		return e.executeInsert(s)
+	case *parser.UpdateStmt:
+		return e.executeUpdate(s)
+	case *parser.DeleteStmt:
+		return e.executeDelete(s)
+	case *parser.SelectStmt:
+		return e.executeSelect(s)
+	default:
 		return nil, fmt.Errorf("exec: unsupported statement type %T", stmt)
 	}
 }
@@ -87,25 +111,34 @@ func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
 // execute. The implementation is deliberately simple but offers callers a
 // stable JSON structure for tooling to consume.
 func (e *Executor) Explain(stmt parser.Statement) (*Plan, error) {
-        switch s := stmt.(type) {
-        case *parser.CreateTableStmt:
-                return newPlan("CreateTable", map[string]interface{}{"table": s.Name}), nil
-        case *parser.DropTableStmt:
-                return newPlan("DropTable", map[string]interface{}{"table": s.Name}), nil
-        case *parser.CreateIndexStmt:
-                detail := map[string]interface{}{"index": s.Name, "table": s.Table, "columns": s.Columns}
-                if s.Unique {
-                        detail["unique"] = true
-                }
-                return &Plan{Root: &PlanNode{Name: "CreateIndex", Detail: detail}}, nil
-        case *parser.DropIndexStmt:
-                return newPlan("DropIndex", map[string]interface{}{"index": s.Name}), nil
-        case *parser.InsertStmt:
-                node := &PlanNode{
-                        Name:   "Insert",
-                        Detail: map[string]interface{}{"table": s.Table, "columns": s.Columns},
-                }
+	switch s := stmt.(type) {
+	case *parser.CreateTableStmt:
+		return newPlan("CreateTable", map[string]interface{}{"table": s.Name}), nil
+	case *parser.DropTableStmt:
+		return newPlan("DropTable", map[string]interface{}{"table": s.Name}), nil
+	case *parser.CreateIndexStmt:
+		detail := map[string]interface{}{"index": s.Name, "table": s.Table, "columns": s.Columns}
+		if s.Unique {
+			detail["unique"] = true
+		}
+		return &Plan{Root: &PlanNode{Name: "CreateIndex", Detail: detail}}, nil
+	case *parser.DropIndexStmt:
+		return newPlan("DropIndex", map[string]interface{}{"index": s.Name}), nil
+	case *parser.InsertStmt:
+		node := &PlanNode{
+			Name:   "Insert",
+			Detail: map[string]interface{}{"table": s.Table, "columns": s.Columns},
+		}
 		return &Plan{Root: node}, nil
+	case *parser.UpdateStmt:
+		cols := make([]string, len(s.Assignments))
+		for i, assign := range s.Assignments {
+			cols[i] = assign.Column
+		}
+		detail := map[string]interface{}{"table": s.Table, "columns": cols}
+		return &Plan{Root: &PlanNode{Name: "Update", Detail: detail}}, nil
+	case *parser.DeleteStmt:
+		return newPlan("Delete", map[string]interface{}{"table": s.Table}), nil
 	case *parser.SelectStmt:
 		return e.explainSelect(s)
 	default:
@@ -119,6 +152,7 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 	}
 	cols := make([]catalog.Column, len(stmt.Columns))
 	seen := map[string]struct{}{}
+	colLookup := make(map[string]*catalog.Column)
 	for i, col := range stmt.Columns {
 		if _, ok := seen[strings.ToLower(col.Name)]; ok {
 			return nil, fmt.Errorf("exec: duplicate column %s", col.Name)
@@ -132,107 +166,195 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 			Scale:     col.Scale,
 			NotNull:   col.NotNull,
 		}
+		colLookup[strings.ToLower(col.Name)] = &cols[i]
 	}
-	table, err := e.catalog.CreateTable(stmt.Name, cols, stmt.PrimaryKey)
+	foreignKeys, err := e.buildForeignKeys(stmt, cols, colLookup)
+	if err != nil {
+		return nil, err
+	}
+	table, err := e.catalog.CreateTable(stmt.Name, cols, stmt.PrimaryKey, foreignKeys)
 	if err != nil {
 		return nil, err
 	}
 	return &Result{Message: fmt.Sprintf("Table %s created", table.Name)}, nil
 }
 
+func (e *Executor) buildForeignKeys(stmt *parser.CreateTableStmt, cols []catalog.Column, lookup map[string]*catalog.Column) ([]*catalog.ForeignKey, error) {
+	if len(stmt.ForeignKeys) == 0 {
+		return nil, nil
+	}
+	usedNames := make(map[string]struct{})
+	counter := 1
+	result := make([]*catalog.ForeignKey, 0, len(stmt.ForeignKeys))
+	for _, fk := range stmt.ForeignKeys {
+		name := fk.Name
+		if name == "" {
+			base := strings.ToLower(stmt.Name)
+			for {
+				candidate := fmt.Sprintf("fk_%s_%d", base, counter)
+				counter++
+				if _, exists := usedNames[strings.ToLower(candidate)]; !exists {
+					name = candidate
+					break
+				}
+			}
+		}
+		lowerName := strings.ToLower(name)
+		if _, exists := usedNames[lowerName]; exists {
+			return nil, fmt.Errorf("exec: duplicate foreign key name %s", name)
+		}
+		usedNames[lowerName] = struct{}{}
+		if len(fk.Columns) == 0 {
+			return nil, fmt.Errorf("exec: foreign key %s must reference at least one child column", name)
+		}
+		childCols := make([]string, len(fk.Columns))
+		childRefs := make([]*catalog.Column, len(fk.Columns))
+		for i, childName := range fk.Columns {
+			childCol, ok := lookup[strings.ToLower(childName)]
+			if !ok {
+				return nil, fmt.Errorf("exec: foreign key %s references unknown column %s", name, childName)
+			}
+			childCols[i] = childCol.Name
+			childRefs[i] = childCol
+		}
+		parentTable, ok := e.catalog.GetTable(fk.ReferencedTable)
+		if !ok {
+			return nil, fmt.Errorf("exec: referenced table %s not found for foreign key %s", fk.ReferencedTable, name)
+		}
+		if len(fk.ReferencedCols) != len(childCols) {
+			return nil, fmt.Errorf("exec: foreign key %s has mismatched column counts", name)
+		}
+		parentCols := make([]string, len(fk.ReferencedCols))
+		parentRefs := make([]*catalog.Column, len(fk.ReferencedCols))
+		for i, parentName := range fk.ReferencedCols {
+			found := false
+			for idx := range parentTable.Columns {
+				if strings.EqualFold(parentTable.Columns[idx].Name, parentName) {
+					parentCols[i] = parentTable.Columns[idx].Name
+					parentRefs[i] = &parentTable.Columns[idx]
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("exec: foreign key %s references unknown column %s on table %s", name, parentName, parentTable.Name)
+			}
+		}
+		for i := range childRefs {
+			if err := ensureForeignKeyTypeCompatibility(name, childRefs[i], parentRefs[i]); err != nil {
+				return nil, err
+			}
+		}
+		if err := ensureParentHasUniqueKey(parentTable, parentCols); err != nil {
+			return nil, fmt.Errorf("exec: foreign key %s: %w", name, err)
+		}
+		result = append(result, &catalog.ForeignKey{
+			Name:          name,
+			ChildColumns:  childCols,
+			ParentTable:   parentTable.Name,
+			ParentColumns: parentCols,
+			OnDelete:      convertForeignKeyAction(fk.OnDelete),
+			OnUpdate:      convertForeignKeyAction(fk.OnUpdate),
+			Deferrable:    false,
+			Valid:         true,
+		})
+	}
+	return result, nil
+}
+
 func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error) {
-        indexes := e.catalog.TableIndexes(stmt.Name)
-        if err := e.catalog.DropTable(stmt.Name); err != nil {
-                return nil, err
-        }
-        for _, idx := range indexes {
-                if err := e.indexes.Drop(stmt.Name, idx.Name); err != nil {
-                        return nil, err
-                }
-        }
-        return &Result{Message: fmt.Sprintf("Table %s dropped", stmt.Name)}, nil
+	indexes := e.catalog.TableIndexes(stmt.Name)
+	if err := e.catalog.DropTable(stmt.Name); err != nil {
+		return nil, err
+	}
+	for _, idx := range indexes {
+		if err := e.indexes.Drop(stmt.Name, idx.Name); err != nil {
+			return nil, err
+		}
+	}
+	return &Result{Message: fmt.Sprintf("Table %s dropped", stmt.Name)}, nil
 }
 
 func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
-        table, ok := e.catalog.GetTable(stmt.Table)
-        if !ok {
-                return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
-        }
-        if len(stmt.Columns) == 0 {
-                return nil, fmt.Errorf("exec: CREATE INDEX requires at least one column")
-        }
-        for _, existing := range table.Indexes {
-                if strings.EqualFold(existing.Name, stmt.Name) {
-                        return nil, fmt.Errorf("exec: index %s already exists on table %s", stmt.Name, stmt.Table)
-                }
-        }
-        positions := make([]int, len(stmt.Columns))
-        resolved := make([]string, len(stmt.Columns))
-        for i, name := range stmt.Columns {
-                found := false
-                for pos, col := range table.Columns {
-                        if strings.EqualFold(col.Name, name) {
-                                positions[i] = pos
-                                resolved[i] = col.Name
-                                found = true
-                                break
-                        }
-                }
-                if !found {
-                        return nil, fmt.Errorf("exec: column %s not found in table %s", name, stmt.Table)
-                }
-        }
-        idxFile, err := e.indexes.Create(table.Name, stmt.Name)
-        if err != nil {
-                return nil, err
-        }
-        entries := make([]indexmgr.Entry, 0, table.RowCount)
-        heap := storage.NewHeapFile(e.storage, table.RootPage)
-        if err := heap.Scan(func(rid storage.RowID, record []byte) error {
-                values, err := DecodeRow(table.Columns, record)
-                if err != nil {
-                        return err
-                }
-                components, skip, err := buildIndexComponents(table.Columns, positions, values)
-                if err != nil {
-                        return err
-                }
-                if skip {
-                        return nil
-                }
-                entry := indexmgr.Entry{Key: encodeIndexKey(components), Row: rid}
-                entries = append(entries, entry)
-                return nil
-        }); err != nil {
-                e.indexes.Drop(table.Name, stmt.Name)
-                return nil, err
-        }
-        if err := idxFile.Rebuild(entries, stmt.Unique); err != nil {
-                e.indexes.Drop(table.Name, stmt.Name)
-                if strings.Contains(err.Error(), "duplicate") {
-                        return nil, fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", stmt.Name)
-                }
-                return nil, err
-        }
-        if _, err := e.catalog.CreateIndex(table.Name, stmt.Name, resolved, stmt.Unique); err != nil {
-                e.indexes.Drop(table.Name, stmt.Name)
-                return nil, err
-        }
-        return &Result{Message: fmt.Sprintf("Index %s created", stmt.Name)}, nil
+	table, ok := e.catalog.GetTable(stmt.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+	}
+	if len(stmt.Columns) == 0 {
+		return nil, fmt.Errorf("exec: CREATE INDEX requires at least one column")
+	}
+	for _, existing := range table.Indexes {
+		if strings.EqualFold(existing.Name, stmt.Name) {
+			return nil, fmt.Errorf("exec: index %s already exists on table %s", stmt.Name, stmt.Table)
+		}
+	}
+	positions := make([]int, len(stmt.Columns))
+	resolved := make([]string, len(stmt.Columns))
+	for i, name := range stmt.Columns {
+		found := false
+		for pos, col := range table.Columns {
+			if strings.EqualFold(col.Name, name) {
+				positions[i] = pos
+				resolved[i] = col.Name
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("exec: column %s not found in table %s", name, stmt.Table)
+		}
+	}
+	idxFile, err := e.indexes.Create(table.Name, stmt.Name)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]indexmgr.Entry, 0, table.RowCount)
+	heap := storage.NewHeapFile(e.storage, table.RootPage)
+	if err := heap.Scan(func(rid storage.RowID, record []byte) error {
+		values, err := DecodeRow(table.Columns, record)
+		if err != nil {
+			return err
+		}
+		components, skip, err := buildIndexComponents(table.Columns, positions, values)
+		if err != nil {
+			return err
+		}
+		if skip {
+			return nil
+		}
+		entry := indexmgr.Entry{Key: encodeIndexKey(components), Row: rid}
+		entries = append(entries, entry)
+		return nil
+	}); err != nil {
+		e.indexes.Drop(table.Name, stmt.Name)
+		return nil, err
+	}
+	if err := idxFile.Rebuild(entries, stmt.Unique); err != nil {
+		e.indexes.Drop(table.Name, stmt.Name)
+		if strings.Contains(err.Error(), "duplicate") {
+			return nil, fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", stmt.Name)
+		}
+		return nil, err
+	}
+	if _, err := e.catalog.CreateIndex(table.Name, stmt.Name, resolved, stmt.Unique); err != nil {
+		e.indexes.Drop(table.Name, stmt.Name)
+		return nil, err
+	}
+	return &Result{Message: fmt.Sprintf("Index %s created", stmt.Name)}, nil
 }
 
 func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
-        table, idx, found := e.catalog.FindIndex(stmt.Name)
-        if !found {
-                return nil, fmt.Errorf("exec: index %s not found", stmt.Name)
-        }
-        if err := e.catalog.DropIndex(table.Name, idx.Name); err != nil {
-                return nil, err
-        }
-        if err := e.indexes.Drop(table.Name, idx.Name); err != nil {
-                return nil, err
-        }
-        return &Result{Message: fmt.Sprintf("Index %s dropped", idx.Name)}, nil
+	table, idx, found := e.catalog.FindIndex(stmt.Name)
+	if !found {
+		return nil, fmt.Errorf("exec: index %s not found", stmt.Name)
+	}
+	if err := e.catalog.DropIndex(table.Name, idx.Name); err != nil {
+		return nil, err
+	}
+	if err := e.indexes.Drop(table.Name, idx.Name); err != nil {
+		return nil, err
+	}
+	return &Result{Message: fmt.Sprintf("Index %s dropped", idx.Name)}, nil
 }
 
 func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
@@ -258,63 +380,242 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 			columnOrder[i] = idx
 		}
 	}
-        heap := storage.NewHeapFile(e.storage, table.RootPage)
-        indexInfos, err := buildIndexInfos(table)
-        if err != nil {
-                return nil, err
-        }
-        total := 0
-        for _, row := range stmt.Rows {
-                if len(row) != len(table.Columns) {
-                        return nil, fmt.Errorf("exec: column count %d does not match value count %d", len(table.Columns), len(row))
-                }
-                values := make([]interface{}, len(table.Columns))
-                for i, col := range table.Columns {
-                        literal := row[columnOrder[i]]
-                        value, err := convertLiteral(literal, col)
-                        if err != nil {
-                                return nil, err
-                        }
-                        values[i] = value
-                }
-                if err := e.ensureUniqueIndexes(table, indexInfos, values); err != nil {
-                        return nil, err
-                }
-                encoded, err := EncodeRow(table.Columns, values)
-                if err != nil {
-                        return nil, err
-                }
-                rid, err := heap.Insert(encoded)
-                if err != nil {
-                        return nil, err
-                }
-                if err := e.insertIntoIndexes(table, indexInfos, values, rid); err != nil {
-                        return nil, err
-                }
-                if err := e.catalog.IncrementRowCount(table.Name); err != nil {
-                        return nil, err
-                }
-                total++
-        }
+	heap := storage.NewHeapFile(e.storage, table.RootPage)
+	indexInfos, err := buildIndexInfos(table)
+	if err != nil {
+		return nil, err
+	}
+	fkInfos, err := e.buildForeignKeyInfos(table)
+	if err != nil {
+		return nil, err
+	}
+	total := 0
+	for _, row := range stmt.Rows {
+		if len(row) != len(table.Columns) {
+			return nil, fmt.Errorf("exec: column count %d does not match value count %d", len(table.Columns), len(row))
+		}
+		values := make([]interface{}, len(table.Columns))
+		for i, col := range table.Columns {
+			literal := row[columnOrder[i]]
+			value, err := convertLiteral(literal, col)
+			if err != nil {
+				return nil, err
+			}
+			values[i] = value
+		}
+		if err := e.ensureUniqueIndexes(table, indexInfos, values, nil); err != nil {
+			return nil, err
+		}
+		if err := e.ensureForeignKeys(table, fkInfos, values); err != nil {
+			return nil, err
+		}
+		encoded, err := EncodeRow(table.Columns, values)
+		if err != nil {
+			return nil, err
+		}
+		rid, err := heap.Insert(encoded)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.insertIntoIndexes(table, indexInfos, values, rid); err != nil {
+			return nil, err
+		}
+		if err := e.catalog.IncrementRowCount(table.Name); err != nil {
+			return nil, err
+		}
+		total++
+	}
 	message := fmt.Sprintf("%d row(s) inserted", total)
 	return &Result{RowsAffected: total, Message: message}, nil
 }
 
-func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
-        validated, err := validator.ValidateSelect(e.catalog, stmt)
-        if err != nil {
-                return nil, err
-        }
+func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
+	validated, err := validator.ValidateDelete(e.catalog, stmt)
+	if err != nil {
+		return nil, err
+	}
+	heap := storage.NewHeapFile(e.storage, validated.Table.RootPage)
+	indexInfos, err := buildIndexInfos(validated.Table)
+	if err != nil {
+		return nil, err
+	}
+	referencing, err := e.buildReferencingForeignKeys(validated.Table)
+	if err != nil {
+		return nil, err
+	}
+	evaluator := newValueEvaluator()
+	deleted := 0
+	err = heap.Scan(func(rid storage.RowID, record []byte) error {
+		values, err := DecodeRow(validated.Table.Columns, record)
+		if err != nil {
+			return err
+		}
+		if validated.Where != nil {
+			evaluator.setRow(values)
+			result, err := evaluator.eval(validated.Where)
+			if err != nil {
+				return err
+			}
+			truth, err := toTruthValue(result)
+			if err != nil {
+				return err
+			}
+			if truth != truthTrue {
+				return nil
+			}
+		}
+		for _, fk := range referencing {
+			key := extractKeyValues(values, fk.parentPositions)
+			if err := e.ensureNoReferencingRows(fk, key); err != nil {
+				return err
+			}
+		}
+		if err := e.removeFromIndexes(validated.Table, indexInfos, values, rid); err != nil {
+			return err
+		}
+		if err := heap.Delete(rid); err != nil {
+			return err
+		}
+		if err := e.catalog.DecrementRowCount(validated.Table.Name); err != nil {
+			return err
+		}
+		deleted++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	message := fmt.Sprintf("%d row(s) deleted", deleted)
+	return &Result{RowsAffected: deleted, Message: message}, nil
+}
 
-        evaluator := newValueEvaluator()
-        var idxChoice *indexChoice
-        if len(validated.Sources) == 1 && len(validated.Joins) == 0 {
-                idxChoice = e.chooseIndex(validated)
-        }
-        rows, err := e.buildFromRows(validated, evaluator, idxChoice)
-        if err != nil {
-                return nil, err
-        }
+func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
+	validated, err := validator.ValidateUpdate(e.catalog, stmt)
+	if err != nil {
+		return nil, err
+	}
+	heap := storage.NewHeapFile(e.storage, validated.Table.RootPage)
+	indexInfos, err := buildIndexInfos(validated.Table)
+	if err != nil {
+		return nil, err
+	}
+	fkInfos, err := e.buildForeignKeyInfos(validated.Table)
+	if err != nil {
+		return nil, err
+	}
+	referencing, err := e.buildReferencingForeignKeys(validated.Table)
+	if err != nil {
+		return nil, err
+	}
+	evaluator := newValueEvaluator()
+	processed := make(map[storage.RowID]struct{})
+	updated := 0
+	err = heap.Scan(func(rid storage.RowID, record []byte) error {
+		if _, skip := processed[rid]; skip {
+			return nil
+		}
+		values, err := DecodeRow(validated.Table.Columns, record)
+		if err != nil {
+			return err
+		}
+		if validated.Where != nil {
+			evaluator.setRow(values)
+			result, err := evaluator.eval(validated.Where)
+			if err != nil {
+				return err
+			}
+			truth, err := toTruthValue(result)
+			if err != nil {
+				return err
+			}
+			if truth != truthTrue {
+				return nil
+			}
+		}
+		evaluator.setRow(values)
+		newValues := make([]interface{}, len(values))
+		copy(newValues, values)
+		changed := false
+		for _, assign := range validated.Assignments {
+			result, err := evaluator.eval(assign.Expr)
+			if err != nil {
+				return err
+			}
+			var newValue interface{}
+			if result.isNull() {
+				if assign.Column.NotNull {
+					return fmt.Errorf("exec: column %s does not allow NULL values", assign.Column.Name)
+				}
+				newValue = nil
+			} else {
+				newValue = result.data
+			}
+			if !valuesEqual(newValues[assign.ColumnIndex], newValue) {
+				changed = true
+			}
+			newValues[assign.ColumnIndex] = newValue
+		}
+		if !changed {
+			return nil
+		}
+		updated++
+		for _, fk := range referencing {
+			oldKey := extractKeyValues(values, fk.parentPositions)
+			newKey := extractKeyValues(newValues, fk.parentPositions)
+			if !valuesEqualSlice(oldKey, newKey) {
+				if err := e.ensureNoReferencingRows(fk, oldKey); err != nil {
+					return err
+				}
+			}
+		}
+		if err := e.ensureUniqueIndexes(validated.Table, indexInfos, newValues, &rid); err != nil {
+			return err
+		}
+		if err := e.ensureForeignKeys(validated.Table, fkInfos, newValues); err != nil {
+			return err
+		}
+		if err := e.removeFromIndexes(validated.Table, indexInfos, values, rid); err != nil {
+			return err
+		}
+		if err := heap.Delete(rid); err != nil {
+			return err
+		}
+		encoded, err := EncodeRow(validated.Table.Columns, newValues)
+		if err != nil {
+			return err
+		}
+		newRid, err := heap.Insert(encoded)
+		if err != nil {
+			return err
+		}
+		processed[newRid] = struct{}{}
+		if err := e.insertIntoIndexes(validated.Table, indexInfos, newValues, newRid); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	message := fmt.Sprintf("%d row(s) updated", updated)
+	return &Result{RowsAffected: updated, Message: message}, nil
+}
+
+func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+	validated, err := validator.ValidateSelect(e.catalog, stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	evaluator := newValueEvaluator()
+	var idxChoice *indexChoice
+	if len(validated.Sources) == 1 && len(validated.Joins) == 0 {
+		idxChoice = e.chooseIndex(validated)
+	}
+	rows, err := e.buildFromRows(validated, evaluator, idxChoice)
+	if err != nil {
+		return nil, err
+	}
 
 	rows, err = e.applyFilter(rows, validated.Filter, evaluator)
 	if err != nil {
@@ -351,20 +652,20 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 }
 
 func (e *Executor) buildFromRows(validated *validator.ValidatedSelect, evaluator *valueEvaluator, choice *indexChoice) ([][]interface{}, error) {
-        if len(validated.Sources) == 0 {
-                return [][]interface{}{{nil}}, nil
-        }
+	if len(validated.Sources) == 0 {
+		return [][]interface{}{{nil}}, nil
+	}
 
-        leftRows, err := e.scanSourceRows(validated.Sources[0], choice)
-        if err != nil {
-                return nil, err
-        }
+	leftRows, err := e.scanSourceRows(validated.Sources[0], choice)
+	if err != nil {
+		return nil, err
+	}
 
-        for _, join := range validated.Joins {
-                rightRows, err := e.scanSourceRows(join.Right, nil)
-                if err != nil {
-                        return nil, err
-                }
+	for _, join := range validated.Joins {
+		rightRows, err := e.scanSourceRows(join.Right, nil)
+		if err != nil {
+			return nil, err
+		}
 		leftRows, err = e.executeJoin(leftRows, rightRows, join, evaluator)
 		if err != nil {
 			return nil, err
@@ -375,330 +676,743 @@ func (e *Executor) buildFromRows(validated *validator.ValidatedSelect, evaluator
 }
 
 func (e *Executor) scanSourceRows(source *validator.TableSource, choice *indexChoice) ([][]interface{}, error) {
-        if choice != nil && choice.source == source {
-                return e.executeIndexScan(choice)
-        }
-        rows := make([][]interface{}, 0, source.Table.RowCount)
-        heap := storage.NewHeapFile(e.storage, source.Table.RootPage)
-        if err := heap.Scan(func(rid storage.RowID, record []byte) error {
-                values, err := DecodeRow(source.Table.Columns, record)
-                if err != nil {
-                        return err
-                }
-                clone := make([]interface{}, len(values))
-                copy(clone, values)
-                rows = append(rows, clone)
-                return nil
-        }); err != nil {
-                return nil, err
-        }
-        return rows, nil
+	if choice != nil && choice.source == source {
+		return e.executeIndexScan(choice)
+	}
+	rows := make([][]interface{}, 0, source.Table.RowCount)
+	heap := storage.NewHeapFile(e.storage, source.Table.RootPage)
+	if err := heap.Scan(func(rid storage.RowID, record []byte) error {
+		values, err := DecodeRow(source.Table.Columns, record)
+		if err != nil {
+			return err
+		}
+		clone := make([]interface{}, len(values))
+		copy(clone, values)
+		rows = append(rows, clone)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (e *Executor) executeIndexScan(choice *indexChoice) ([][]interface{}, error) {
-        idxFile, err := e.indexes.Open(choice.source.Table.Name, choice.info.def.Name)
-        if err != nil {
-                return nil, err
-        }
-        heap := storage.NewHeapFile(e.storage, choice.source.Table.RootPage)
-        prefixKey := encodeIndexKey(choice.prefix)
-        var rids []storage.RowID
-        switch {
-        case choice.lower != nil || choice.upper != nil:
-                rids = idxFile.Range(prefixKey, choice.lower, choice.lowerInclusive, choice.upper, choice.upperInclusive)
-        case len(prefixKey) > 0:
-                rids = idxFile.SeekPrefix(prefixKey)
-        default:
-                return nil, fmt.Errorf("exec: index scan requires at least one predicate")
-        }
-        rows := make([][]interface{}, 0, len(rids))
-        for _, rid := range rids {
-                record, err := heap.Fetch(rid)
-                if err != nil {
-                        return nil, err
-                }
-                values, err := DecodeRow(choice.source.Table.Columns, record)
-                if err != nil {
-                        return nil, err
-                }
-                clone := make([]interface{}, len(values))
-                copy(clone, values)
-                rows = append(rows, clone)
-        }
-        return rows, nil
+	idxFile, err := e.indexes.Open(choice.source.Table.Name, choice.info.def.Name)
+	if err != nil {
+		return nil, err
+	}
+	heap := storage.NewHeapFile(e.storage, choice.source.Table.RootPage)
+	prefixKey := encodeIndexKey(choice.prefix)
+	var rids []storage.RowID
+	switch {
+	case choice.lower != nil || choice.upper != nil:
+		rids = idxFile.Range(prefixKey, choice.lower, choice.lowerInclusive, choice.upper, choice.upperInclusive)
+	case len(prefixKey) > 0:
+		rids = idxFile.SeekPrefix(prefixKey)
+	default:
+		return nil, fmt.Errorf("exec: index scan requires at least one predicate")
+	}
+	rows := make([][]interface{}, 0, len(rids))
+	for _, rid := range rids {
+		record, err := heap.Fetch(rid)
+		if err != nil {
+			return nil, err
+		}
+		values, err := DecodeRow(choice.source.Table.Columns, record)
+		if err != nil {
+			return nil, err
+		}
+		clone := make([]interface{}, len(values))
+		copy(clone, values)
+		rows = append(rows, clone)
+	}
+	return rows, nil
 }
 
 func buildIndexInfos(table *catalog.Table) ([]indexInfo, error) {
-        if len(table.Indexes) == 0 {
-                return nil, nil
-        }
-        indexes := make([]*catalog.Index, 0, len(table.Indexes))
-        for _, idx := range table.Indexes {
-                indexes = append(indexes, idx)
-        }
-        sort.Slice(indexes, func(i, j int) bool {
-                return strings.ToLower(indexes[i].Name) < strings.ToLower(indexes[j].Name)
-        })
-        infos := make([]indexInfo, 0, len(indexes))
-        for _, idx := range indexes {
-                positions := make([]int, len(idx.Columns))
-                for i, name := range idx.Columns {
-                        found := false
-                        for pos, col := range table.Columns {
-                                if strings.EqualFold(col.Name, name) {
-                                        positions[i] = pos
-                                        found = true
-                                        break
-                                }
-                        }
-                        if !found {
-                                return nil, fmt.Errorf("exec: index column %s not found on table %s", name, table.Name)
-                        }
-                }
-                infos = append(infos, indexInfo{def: idx, positions: positions})
-        }
-        return infos, nil
+	if len(table.Indexes) == 0 {
+		return nil, nil
+	}
+	indexes := make([]*catalog.Index, 0, len(table.Indexes))
+	for _, idx := range table.Indexes {
+		indexes = append(indexes, idx)
+	}
+	sort.Slice(indexes, func(i, j int) bool {
+		return strings.ToLower(indexes[i].Name) < strings.ToLower(indexes[j].Name)
+	})
+	infos := make([]indexInfo, 0, len(indexes))
+	for _, idx := range indexes {
+		positions := make([]int, len(idx.Columns))
+		for i, name := range idx.Columns {
+			found := false
+			for pos, col := range table.Columns {
+				if strings.EqualFold(col.Name, name) {
+					positions[i] = pos
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("exec: index column %s not found on table %s", name, table.Name)
+			}
+		}
+		infos = append(infos, indexInfo{def: idx, positions: positions})
+	}
+	return infos, nil
 }
 
-func (e *Executor) ensureUniqueIndexes(table *catalog.Table, infos []indexInfo, values []interface{}) error {
-        for _, info := range infos {
-                if !info.def.IsUnique {
-                        continue
-                }
-                components, skip, err := buildIndexComponents(table.Columns, info.positions, values)
-                if err != nil {
-                        return err
-                }
-                if skip {
-                        continue
-                }
-                key := encodeIndexKey(components)
-                idxFile, err := e.indexes.Open(table.Name, info.def.Name)
-                if err != nil {
-                        return err
-                }
-                if existing := idxFile.SeekExact(key); len(existing) > 0 {
-                        return fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", info.def.Name)
-                }
-        }
-        return nil
+func (e *Executor) buildForeignKeyInfos(table *catalog.Table) ([]foreignKeyInfo, error) {
+	if len(table.ForeignKeys) == 0 {
+		return nil, nil
+	}
+	infos := make([]foreignKeyInfo, 0, len(table.ForeignKeys))
+	for _, fk := range table.ForeignKeys {
+		childPositions := make([]int, len(fk.ChildColumns))
+		for i, name := range fk.ChildColumns {
+			pos := findColumnIndex(table.Columns, name)
+			if pos < 0 {
+				return nil, fmt.Errorf("exec: foreign key %s references unknown column %s", fk.Name, name)
+			}
+			childPositions[i] = pos
+		}
+		parentTable, ok := e.catalog.GetTable(fk.ParentTable)
+		if !ok {
+			return nil, fmt.Errorf("exec: referenced table %s not found for foreign key %s", fk.ParentTable, fk.Name)
+		}
+		parentPositions := make([]int, len(fk.ParentColumns))
+		for i, name := range fk.ParentColumns {
+			pos := findColumnIndex(parentTable.Columns, name)
+			if pos < 0 {
+				return nil, fmt.Errorf("exec: foreign key %s references unknown parent column %s", fk.Name, name)
+			}
+			parentPositions[i] = pos
+		}
+		parentIndex := findMatchingUniqueIndex(parentTable, fk.ParentColumns)
+		childIndex := findIndexByColumns(table.Indexes, fk.ChildColumns)
+		infos = append(infos, foreignKeyInfo{def: fk, childPositions: childPositions, parentTable: parentTable, parentPositions: parentPositions, parentIndex: parentIndex, childIndex: childIndex})
+	}
+	return infos, nil
+}
+
+func (e *Executor) buildReferencingForeignKeys(table *catalog.Table) ([]referencingForeignKey, error) {
+	tables := e.catalog.ListTables()
+	result := make([]referencingForeignKey, 0)
+	for _, snapshot := range tables {
+		child, ok := e.catalog.GetTable(snapshot.Name)
+		if !ok {
+			continue
+		}
+		for _, fk := range child.ForeignKeys {
+			if !strings.EqualFold(fk.ParentTable, table.Name) {
+				continue
+			}
+			childPositions := make([]int, len(fk.ChildColumns))
+			for i, name := range fk.ChildColumns {
+				pos := findColumnIndex(child.Columns, name)
+				if pos < 0 {
+					return nil, fmt.Errorf("exec: foreign key %s on table %s references unknown column %s", fk.Name, child.Name, name)
+				}
+				childPositions[i] = pos
+			}
+			parentPositions := make([]int, len(fk.ParentColumns))
+			for i, name := range fk.ParentColumns {
+				pos := findColumnIndex(table.Columns, name)
+				if pos < 0 {
+					return nil, fmt.Errorf("exec: foreign key %s references unknown column %s on table %s", fk.Name, name, table.Name)
+				}
+				parentPositions[i] = pos
+			}
+			childIndex := findIndexByColumns(child.Indexes, fk.ChildColumns)
+			result = append(result, referencingForeignKey{table: child, def: fk, childPositions: childPositions, childIndex: childIndex, parentPositions: parentPositions})
+		}
+	}
+	return result, nil
+}
+
+func (e *Executor) ensureUniqueIndexes(table *catalog.Table, infos []indexInfo, values []interface{}, current *storage.RowID) error {
+	for _, info := range infos {
+		if !info.def.IsUnique {
+			continue
+		}
+		components, skip, err := buildIndexComponents(table.Columns, info.positions, values)
+		if err != nil {
+			return err
+		}
+		if skip {
+			continue
+		}
+		key := encodeIndexKey(components)
+		idxFile, err := e.indexes.Open(table.Name, info.def.Name)
+		if err != nil {
+			return err
+		}
+		if existing := idxFile.SeekExact(key); len(existing) > 0 {
+			if current != nil {
+				filtered := existing[:0]
+				for _, rid := range existing {
+					if rid == *current {
+						continue
+					}
+					filtered = append(filtered, rid)
+				}
+				if len(filtered) == 0 {
+					continue
+				}
+				return fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", info.def.Name)
+			}
+			return fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", info.def.Name)
+		}
+	}
+	return nil
 }
 
 func (e *Executor) insertIntoIndexes(table *catalog.Table, infos []indexInfo, values []interface{}, rid storage.RowID) error {
-        for _, info := range infos {
-                components, skip, err := buildIndexComponents(table.Columns, info.positions, values)
-                if err != nil {
-                        return err
-                }
-                if skip {
-                        continue
-                }
-                key := encodeIndexKey(components)
-                idxFile, err := e.indexes.Open(table.Name, info.def.Name)
-                if err != nil {
-                        return err
-                }
-                if err := idxFile.Insert(key, rid, info.def.IsUnique); err != nil {
-                        if info.def.IsUnique && strings.Contains(err.Error(), "duplicate") {
-                                return fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", info.def.Name)
-                        }
-                        return err
-                }
-        }
-        return nil
+	for _, info := range infos {
+		components, skip, err := buildIndexComponents(table.Columns, info.positions, values)
+		if err != nil {
+			return err
+		}
+		if skip {
+			continue
+		}
+		key := encodeIndexKey(components)
+		idxFile, err := e.indexes.Open(table.Name, info.def.Name)
+		if err != nil {
+			return err
+		}
+		if err := idxFile.Insert(key, rid, info.def.IsUnique); err != nil {
+			if info.def.IsUnique && strings.Contains(err.Error(), "duplicate") {
+				return fmt.Errorf("exec: duplicate key value violates unique index \"%s\"", info.def.Name)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Executor) removeFromIndexes(table *catalog.Table, infos []indexInfo, values []interface{}, rid storage.RowID) error {
+	for _, info := range infos {
+		components, skip, err := buildIndexComponents(table.Columns, info.positions, values)
+		if err != nil {
+			return err
+		}
+		if skip {
+			continue
+		}
+		key := encodeIndexKey(components)
+		idxFile, err := e.indexes.Open(table.Name, info.def.Name)
+		if err != nil {
+			return err
+		}
+		if err := idxFile.Delete(key, rid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Executor) ensureForeignKeys(table *catalog.Table, infos []foreignKeyInfo, values []interface{}) error {
+	if len(infos) == 0 {
+		return nil
+	}
+	for _, info := range infos {
+		keyValues := extractKeyValues(values, info.childPositions)
+		if allValuesNull(keyValues) {
+			continue
+		}
+		exists, err := e.parentRowExists(info, keyValues)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("foreign key violation on \"%s\": no parent row in \"%s\" for key (%s) = (%s)", info.def.Name, info.parentTable.Name, strings.Join(info.def.ChildColumns, ", "), formatKeyValues(keyValues))
+		}
+	}
+	return nil
+}
+
+func (e *Executor) parentRowExists(info foreignKeyInfo, keyValues []interface{}) (bool, error) {
+	parentValues := make([]interface{}, len(info.parentTable.Columns))
+	for i, pos := range info.parentPositions {
+		parentValues[pos] = keyValues[i]
+	}
+	if info.parentIndex != nil {
+		components, skip, err := buildIndexComponents(info.parentTable.Columns, info.parentPositions, parentValues)
+		if err != nil {
+			return false, err
+		}
+		if skip {
+			return false, nil
+		}
+		idxFile, err := e.indexes.Open(info.parentTable.Name, info.parentIndex.Name)
+		if err != nil {
+			return false, err
+		}
+		results := idxFile.SeekExact(encodeIndexKey(components))
+		return len(results) > 0, nil
+	}
+	heap := storage.NewHeapFile(e.storage, info.parentTable.RootPage)
+	found := false
+	err := heap.Scan(func(_ storage.RowID, record []byte) error {
+		values, err := DecodeRow(info.parentTable.Columns, record)
+		if err != nil {
+			return err
+		}
+		match := true
+		for i, pos := range info.parentPositions {
+			if !valuesEqual(values[pos], keyValues[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			found = true
+			return errStopScan
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopScan) {
+		return false, err
+	}
+	return found, nil
+}
+
+func extractKeyValues(values []interface{}, positions []int) []interface{} {
+	result := make([]interface{}, len(positions))
+	for i, pos := range positions {
+		result[i] = values[pos]
+	}
+	return result
+}
+
+func allValuesNull(values []interface{}) bool {
+	for _, v := range values {
+		if v != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func formatKeyValues(values []interface{}) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		if v == nil {
+			parts[i] = "NULL"
+			continue
+		}
+		switch val := v.(type) {
+		case string:
+			parts[i] = fmt.Sprintf("'%s'", val)
+		case time.Time:
+			parts[i] = fmt.Sprintf("'%s'", val.UTC().Format(time.RFC3339))
+		case decimal.Decimal:
+			parts[i] = val.String()
+		default:
+			parts[i] = fmt.Sprintf("%v", val)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func valuesEqual(a, b interface{}) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	switch left := a.(type) {
+	case int32:
+		right, ok := b.(int32)
+		return ok && left == right
+	case int64:
+		right, ok := b.(int64)
+		return ok && left == right
+	case bool:
+		right, ok := b.(bool)
+		return ok && left == right
+	case string:
+		right, ok := b.(string)
+		return ok && left == right
+	case time.Time:
+		right, ok := b.(time.Time)
+		return ok && left.Equal(right)
+	case decimal.Decimal:
+		right, ok := b.(decimal.Decimal)
+		return ok && left.Equal(right)
+	default:
+		return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+	}
+}
+
+func valuesEqualSlice(a, b []interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !valuesEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Executor) hasReferencingRows(info referencingForeignKey, keyValues []interface{}) (bool, error) {
+	childValues := make([]interface{}, len(info.table.Columns))
+	for i, pos := range info.childPositions {
+		childValues[pos] = keyValues[i]
+	}
+	if info.childIndex != nil {
+		components, skip, err := buildIndexComponents(info.table.Columns, info.childPositions, childValues)
+		if err != nil {
+			return false, err
+		}
+		if skip {
+			return false, nil
+		}
+		idxFile, err := e.indexes.Open(info.table.Name, info.childIndex.Name)
+		if err != nil {
+			return false, err
+		}
+		results := idxFile.SeekExact(encodeIndexKey(components))
+		return len(results) > 0, nil
+	}
+	heap := storage.NewHeapFile(e.storage, info.table.RootPage)
+	found := false
+	err := heap.Scan(func(_ storage.RowID, record []byte) error {
+		values, err := DecodeRow(info.table.Columns, record)
+		if err != nil {
+			return err
+		}
+		match := true
+		for i, pos := range info.childPositions {
+			if !valuesEqual(values[pos], keyValues[i]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			found = true
+			return errStopScan
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopScan) {
+		return false, err
+	}
+	return found, nil
+}
+
+func (e *Executor) ensureNoReferencingRows(fk referencingForeignKey, keyValues []interface{}) error {
+	exists, err := e.hasReferencingRows(fk, keyValues)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("foreign key violation on \"%s\": referenced by \"%s\" for key (%s) = (%s)", fk.def.Name, fk.table.Name, strings.Join(fk.def.ParentColumns, ", "), formatKeyValues(keyValues))
+	}
+	return nil
 }
 
 func (e *Executor) chooseIndex(validated *validator.ValidatedSelect) *indexChoice {
-        if len(validated.Sources) != 1 || len(validated.Joins) > 0 {
-                return nil
-        }
-        if validated.Filter == nil {
-                return nil
-        }
-        source := validated.Sources[0]
-        restrictions := make(map[int]*columnRestriction)
-        if !collectRestrictions(validated.Filter, restrictions, source.ColumnStart, source.ColumnStart+source.ColumnCount) {
-                return nil
-        }
-        if len(restrictions) == 0 {
-                return nil
-        }
-        infos, err := buildIndexInfos(source.Table)
-        if err != nil || len(infos) == 0 {
-                return nil
-        }
-        for _, info := range infos {
-                if choice := buildChoiceForIndex(source, info, restrictions); choice != nil {
-                        return choice
-                }
-        }
-        return nil
+	if len(validated.Sources) != 1 || len(validated.Joins) > 0 {
+		return nil
+	}
+	if validated.Filter == nil {
+		return nil
+	}
+	source := validated.Sources[0]
+	restrictions := make(map[int]*columnRestriction)
+	if !collectRestrictions(validated.Filter, restrictions, source.ColumnStart, source.ColumnStart+source.ColumnCount) {
+		return nil
+	}
+	if len(restrictions) == 0 {
+		return nil
+	}
+	infos, err := buildIndexInfos(source.Table)
+	if err != nil || len(infos) == 0 {
+		return nil
+	}
+	for _, info := range infos {
+		if choice := buildChoiceForIndex(source, info, restrictions); choice != nil {
+			return choice
+		}
+	}
+	return nil
 }
 
 func collectRestrictions(node expr.TypedExpr, restrictions map[int]*columnRestriction, start, end int) bool {
-        binary, ok := node.(*expr.BinaryExpr)
-        if !ok {
-                return false
-        }
-        switch binary.Op {
-        case expr.BinaryOpAnd:
-                return collectRestrictions(binary.Left, restrictions, start, end) && collectRestrictions(binary.Right, restrictions, start, end)
-        case expr.BinaryOpOr:
-                return false
-        default:
-                cond, ok := parseSimpleCondition(binary, start, end)
-                if !ok {
-                        return false
-                }
-                res := restrictions[cond.column]
-                if res == nil {
-                        res = &columnRestriction{}
-                        restrictions[cond.column] = res
-                }
-                switch cond.op {
-                case expr.BinaryOpEqual:
-                        res.eqValue = cond.value
-                case expr.BinaryOpGreater:
-                        res.lowerValue = cond.value
-                        res.lowerInclusive = false
-                case expr.BinaryOpGreaterEqual:
-                        res.lowerValue = cond.value
-                        res.lowerInclusive = true
-                case expr.BinaryOpLess:
-                        res.upperValue = cond.value
-                        res.upperInclusive = false
-                case expr.BinaryOpLessEqual:
-                        res.upperValue = cond.value
-                        res.upperInclusive = true
-                default:
-                        return false
-                }
-                return true
-        }
+	binary, ok := node.(*expr.BinaryExpr)
+	if !ok {
+		return false
+	}
+	switch binary.Op {
+	case expr.BinaryOpAnd:
+		return collectRestrictions(binary.Left, restrictions, start, end) && collectRestrictions(binary.Right, restrictions, start, end)
+	case expr.BinaryOpOr:
+		return false
+	default:
+		cond, ok := parseSimpleCondition(binary, start, end)
+		if !ok {
+			return false
+		}
+		res := restrictions[cond.column]
+		if res == nil {
+			res = &columnRestriction{}
+			restrictions[cond.column] = res
+		}
+		switch cond.op {
+		case expr.BinaryOpEqual:
+			res.eqValue = cond.value
+		case expr.BinaryOpGreater:
+			res.lowerValue = cond.value
+			res.lowerInclusive = false
+		case expr.BinaryOpGreaterEqual:
+			res.lowerValue = cond.value
+			res.lowerInclusive = true
+		case expr.BinaryOpLess:
+			res.upperValue = cond.value
+			res.upperInclusive = false
+		case expr.BinaryOpLessEqual:
+			res.upperValue = cond.value
+			res.upperInclusive = true
+		default:
+			return false
+		}
+		return true
+	}
+}
+
+func ensureForeignKeyTypeCompatibility(name string, child, parent *catalog.Column) error {
+	if child.Type != parent.Type {
+		return fmt.Errorf("exec: foreign key %s column %s type %s does not match referenced column %s type %s", name, child.Name, formatColumnType(*child), parent.Name, formatColumnType(*parent))
+	}
+	switch child.Type {
+	case catalog.ColumnTypeVarChar:
+		if child.Length != parent.Length {
+			return fmt.Errorf("exec: foreign key %s column %s length %d does not match referenced column %s length %d", name, child.Name, child.Length, parent.Name, parent.Length)
+		}
+	case catalog.ColumnTypeDecimal:
+		if child.Precision != parent.Precision || child.Scale != parent.Scale {
+			return fmt.Errorf("exec: foreign key %s column %s precision/scale %d,%d does not match referenced column %s precision/scale %d,%d", name, child.Name, child.Precision, child.Scale, parent.Name, parent.Precision, parent.Scale)
+		}
+	}
+	return nil
+}
+
+func ensureParentHasUniqueKey(parent *catalog.Table, columns []string) error {
+	pkCols := make([]string, 0)
+	for _, col := range parent.Columns {
+		if col.PrimaryKey {
+			pkCols = append(pkCols, col.Name)
+		}
+	}
+	if len(pkCols) == len(columns) && len(pkCols) > 0 && columnsMatch(pkCols, columns) {
+		return nil
+	}
+	for _, idx := range parent.Indexes {
+		if !idx.IsUnique {
+			continue
+		}
+		if columnsMatch(idx.Columns, columns) {
+			return nil
+		}
+	}
+	return fmt.Errorf("referenced columns (%s) on table %s are not backed by a unique key", strings.Join(columns, ", "), parent.Name)
+}
+
+func columnsMatch(candidate, target []string) bool {
+	if len(candidate) != len(target) {
+		return false
+	}
+	for i := range candidate {
+		if !strings.EqualFold(candidate[i], target[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func findColumnIndex(columns []catalog.Column, name string) int {
+	for i, col := range columns {
+		if strings.EqualFold(col.Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+func findMatchingUniqueIndex(table *catalog.Table, columns []string) *catalog.Index {
+	for _, idx := range table.Indexes {
+		if idx.IsUnique && columnsMatch(idx.Columns, columns) {
+			return idx
+		}
+	}
+	return nil
+}
+
+func findIndexByColumns(indexes map[string]*catalog.Index, columns []string) *catalog.Index {
+	for _, idx := range indexes {
+		if columnsMatch(idx.Columns, columns) {
+			return idx
+		}
+	}
+	return nil
+}
+
+func formatColumnType(col catalog.Column) string {
+	switch col.Type {
+	case catalog.ColumnTypeInt:
+		return "INT"
+	case catalog.ColumnTypeBigInt:
+		return "BIGINT"
+	case catalog.ColumnTypeBoolean:
+		return "BOOLEAN"
+	case catalog.ColumnTypeVarChar:
+		return fmt.Sprintf("VARCHAR(%d)", col.Length)
+	case catalog.ColumnTypeDate:
+		return "DATE"
+	case catalog.ColumnTypeTimestamp:
+		return "TIMESTAMP"
+	case catalog.ColumnTypeDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", col.Precision, col.Scale)
+	default:
+		return fmt.Sprintf("TYPE(%d)", col.Type)
+	}
+}
+
+func convertForeignKeyAction(action parser.ForeignKeyAction) catalog.ForeignKeyAction {
+	switch action {
+	case parser.ForeignKeyActionNoAction:
+		return catalog.ForeignKeyActionNoAction
+	default:
+		return catalog.ForeignKeyActionRestrict
+	}
 }
 
 type simpleCondition struct {
-        column int
-        op     expr.BinaryOp
-        value  interface{}
+	column int
+	op     expr.BinaryOp
+	value  interface{}
 }
 
 func parseSimpleCondition(binary *expr.BinaryExpr, start, end int) (simpleCondition, bool) {
-        var column *expr.ColumnRef
-        var literal interface{}
-        invert := false
-        switch left := binary.Left.(type) {
-        case *expr.ColumnRef:
-                column = left
-                if lit, ok := binary.Right.(*expr.Literal); ok {
-                        literal = lit.Value
-                } else {
-                        return simpleCondition{}, false
-                }
-        case *expr.Literal:
-                if col, ok := binary.Right.(*expr.ColumnRef); ok {
-                        column = col
-                        literal = left.Value
-                        invert = true
-                } else {
-                        return simpleCondition{}, false
-                }
-        default:
-                return simpleCondition{}, false
-        }
-        if literal == nil {
-                return simpleCondition{}, false
-        }
-        if column.Index < start || column.Index >= end {
-                return simpleCondition{}, false
-        }
-        op := binary.Op
-        if invert {
-                op = invertOperator(op)
-        }
-        switch op {
-        case expr.BinaryOpEqual, expr.BinaryOpGreater, expr.BinaryOpGreaterEqual, expr.BinaryOpLess, expr.BinaryOpLessEqual:
-                return simpleCondition{column: column.Index - start, op: op, value: literal}, true
-        default:
-                return simpleCondition{}, false
-        }
+	var column *expr.ColumnRef
+	var literal interface{}
+	invert := false
+	switch left := binary.Left.(type) {
+	case *expr.ColumnRef:
+		column = left
+		if lit, ok := binary.Right.(*expr.Literal); ok {
+			literal = lit.Value
+		} else {
+			return simpleCondition{}, false
+		}
+	case *expr.Literal:
+		if col, ok := binary.Right.(*expr.ColumnRef); ok {
+			column = col
+			literal = left.Value
+			invert = true
+		} else {
+			return simpleCondition{}, false
+		}
+	default:
+		return simpleCondition{}, false
+	}
+	if literal == nil {
+		return simpleCondition{}, false
+	}
+	if column.Index < start || column.Index >= end {
+		return simpleCondition{}, false
+	}
+	op := binary.Op
+	if invert {
+		op = invertOperator(op)
+	}
+	switch op {
+	case expr.BinaryOpEqual, expr.BinaryOpGreater, expr.BinaryOpGreaterEqual, expr.BinaryOpLess, expr.BinaryOpLessEqual:
+		return simpleCondition{column: column.Index - start, op: op, value: literal}, true
+	default:
+		return simpleCondition{}, false
+	}
 }
 
 func invertOperator(op expr.BinaryOp) expr.BinaryOp {
-        switch op {
-        case expr.BinaryOpLess:
-                return expr.BinaryOpGreater
-        case expr.BinaryOpLessEqual:
-                return expr.BinaryOpGreaterEqual
-        case expr.BinaryOpGreater:
-                return expr.BinaryOpLess
-        case expr.BinaryOpGreaterEqual:
-                return expr.BinaryOpLessEqual
-        default:
-                return op
-        }
+	switch op {
+	case expr.BinaryOpLess:
+		return expr.BinaryOpGreater
+	case expr.BinaryOpLessEqual:
+		return expr.BinaryOpGreaterEqual
+	case expr.BinaryOpGreater:
+		return expr.BinaryOpLess
+	case expr.BinaryOpGreaterEqual:
+		return expr.BinaryOpLessEqual
+	default:
+		return op
+	}
 }
 
 func buildChoiceForIndex(source *validator.TableSource, info indexInfo, restrictions map[int]*columnRestriction) *indexChoice {
-        prefix := make([][]byte, 0, len(info.positions))
-        var lowerBytes, upperBytes []byte
-        lowerInclusive, upperInclusive := true, true
-        var lowerValue, upperValue interface{}
-        usedRange := false
-        for _, pos := range info.positions {
-                res := restrictions[pos]
-                if res == nil {
-                        break
-                }
-                if res.eqValue != nil {
-                        comp, err := encodeComponent(source.Table.Columns[pos], res.eqValue)
-                        if err != nil {
-                                return nil
-                        }
-                        prefix = append(prefix, comp)
-                        continue
-                }
-                if usedRange {
-                        break
-                }
-                if res.lowerValue != nil {
-                        lb, err := encodeComponent(source.Table.Columns[pos], res.lowerValue)
-                        if err != nil {
-                                return nil
-                        }
-                        lowerBytes = lb
-                        lowerInclusive = res.lowerInclusive
-                        lowerValue = res.lowerValue
-                }
-                if res.upperValue != nil {
-                        ub, err := encodeComponent(source.Table.Columns[pos], res.upperValue)
-                        if err != nil {
-                                return nil
-                        }
-                        upperBytes = ub
-                        upperInclusive = res.upperInclusive
-                        upperValue = res.upperValue
-                }
-                if lowerBytes == nil && upperBytes == nil {
-                        break
-                }
-                usedRange = true
-                break
-        }
-        if len(prefix) == 0 && lowerBytes == nil && upperBytes == nil {
-                return nil
-        }
-        return &indexChoice{
-                source:         source,
-                info:           info,
-                prefix:         prefix,
-                lower:          lowerBytes,
-                lowerInclusive: lowerInclusive,
-                upper:          upperBytes,
-                upperInclusive: upperInclusive,
-                lowerValue:     lowerValue,
-                upperValue:     upperValue,
-        }
+	prefix := make([][]byte, 0, len(info.positions))
+	var lowerBytes, upperBytes []byte
+	lowerInclusive, upperInclusive := true, true
+	var lowerValue, upperValue interface{}
+	usedRange := false
+	for _, pos := range info.positions {
+		res := restrictions[pos]
+		if res == nil {
+			break
+		}
+		if res.eqValue != nil {
+			comp, err := encodeComponent(source.Table.Columns[pos], res.eqValue)
+			if err != nil {
+				return nil
+			}
+			prefix = append(prefix, comp)
+			continue
+		}
+		if usedRange {
+			break
+		}
+		if res.lowerValue != nil {
+			lb, err := encodeComponent(source.Table.Columns[pos], res.lowerValue)
+			if err != nil {
+				return nil
+			}
+			lowerBytes = lb
+			lowerInclusive = res.lowerInclusive
+			lowerValue = res.lowerValue
+		}
+		if res.upperValue != nil {
+			ub, err := encodeComponent(source.Table.Columns[pos], res.upperValue)
+			if err != nil {
+				return nil
+			}
+			upperBytes = ub
+			upperInclusive = res.upperInclusive
+			upperValue = res.upperValue
+		}
+		if lowerBytes == nil && upperBytes == nil {
+			break
+		}
+		usedRange = true
+		break
+	}
+	if len(prefix) == 0 && lowerBytes == nil && upperBytes == nil {
+		return nil
+	}
+	return &indexChoice{
+		source:         source,
+		info:           info,
+		prefix:         prefix,
+		lower:          lowerBytes,
+		lowerInclusive: lowerInclusive,
+		upper:          upperBytes,
+		upperInclusive: upperInclusive,
+		lowerValue:     lowerValue,
+		upperValue:     upperValue,
+	}
 }
 
 func (e *Executor) executeJoin(leftRows, rightRows [][]interface{}, join *validator.JoinClause, evaluator *valueEvaluator) ([][]interface{}, error) {
@@ -1311,20 +2025,20 @@ func (e *Executor) projectRows(rows [][]interface{}, outputs []validator.OutputC
 }
 
 func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
-        validated, err := validator.ValidateSelect(e.catalog, stmt)
-        if err != nil {
-                return nil, err
-        }
+	validated, err := validator.ValidateSelect(e.catalog, stmt)
+	if err != nil {
+		return nil, err
+	}
 
-        var idxChoice *indexChoice
-        if len(validated.Sources) == 1 && len(validated.Joins) == 0 {
-                idxChoice = e.chooseIndex(validated)
-        }
+	var idxChoice *indexChoice
+	if len(validated.Sources) == 1 && len(validated.Joins) == 0 {
+		idxChoice = e.chooseIndex(validated)
+	}
 
-        columnNames := make([]string, len(validated.Outputs))
-        for i, out := range validated.Outputs {
-                columnNames[i] = out.Name
-        }
+	columnNames := make([]string, len(validated.Outputs))
+	for i, out := range validated.Outputs {
+		columnNames[i] = out.Name
+	}
 
 	project := &PlanNode{Name: "Project", Detail: map[string]interface{}{"columns": columnNames}}
 	current := project
@@ -1371,29 +2085,29 @@ func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
 		current.Children = append(current.Children, aggregateNode)
 		current = aggregateNode
 	}
-        if validated.Filter != nil {
-                filterNode := &PlanNode{Name: "Filter"}
-                current.Children = append(current.Children, filterNode)
-                current = filterNode
-        }
-        join := buildJoinPlan(validated, idxChoice)
-        current.Children = append(current.Children, join)
+	if validated.Filter != nil {
+		filterNode := &PlanNode{Name: "Filter"}
+		current.Children = append(current.Children, filterNode)
+		current = filterNode
+	}
+	join := buildJoinPlan(validated, idxChoice)
+	current.Children = append(current.Children, join)
 
-        return &Plan{Root: project}, nil
+	return &Plan{Root: project}, nil
 }
 
 func buildJoinPlan(validated *validator.ValidatedSelect, choice *indexChoice) *PlanNode {
-        if len(validated.Sources) == 0 {
-                return &PlanNode{Name: "Const"}
-        }
-        left := planForSource(validated.Sources[0], choice)
-        for _, join := range validated.Joins {
-                algorithm := "NestedLoopJoin"
-                if len(join.EquiConditions) > 0 {
-                        algorithm = "HashJoin"
-                }
-                detail := map[string]interface{}{"type": joinTypeString(join.Type)}
-                if len(join.EquiConditions) > 0 {
+	if len(validated.Sources) == 0 {
+		return &PlanNode{Name: "Const"}
+	}
+	left := planForSource(validated.Sources[0], choice)
+	for _, join := range validated.Joins {
+		algorithm := "NestedLoopJoin"
+		if len(join.EquiConditions) > 0 {
+			algorithm = "HashJoin"
+		}
+		detail := map[string]interface{}{"type": joinTypeString(join.Type)}
+		if len(join.EquiConditions) > 0 {
 			keys := make([]string, len(join.EquiConditions))
 			for i, cond := range join.EquiConditions {
 				leftBinding := validated.Bindings[cond.LeftColumn]
@@ -1407,38 +2121,38 @@ func buildJoinPlan(validated *validator.ValidatedSelect, choice *indexChoice) *P
 		}
 		joinNode := &PlanNode{Name: algorithm, Detail: detail}
 		joinNode.Children = append(joinNode.Children, left)
-                joinNode.Children = append(joinNode.Children, planForSource(join.Right, nil))
-                left = joinNode
-        }
-        return left
+		joinNode.Children = append(joinNode.Children, planForSource(join.Right, nil))
+		left = joinNode
+	}
+	return left
 }
 
 func planForSource(source *validator.TableSource, choice *indexChoice) *PlanNode {
-        detail := map[string]interface{}{"table": source.Table.Name}
-        if !strings.EqualFold(source.Alias, source.Table.Name) {
-                detail["alias"] = source.Alias
-        }
-        if choice != nil && choice.source == source {
-                detail["index"] = choice.info.def.Name
-                if len(choice.prefix) > 0 {
-                        used := choice.info.def.Columns[:len(choice.prefix)]
-                        detail["prefix"] = used
-                }
-                if choice.lower != nil || choice.upper != nil {
-                        rangeInfo := map[string]interface{}{}
-                        if choice.lower != nil {
-                                rangeInfo["lower"] = choice.lowerValue
-                                rangeInfo["lowerInclusive"] = choice.lowerInclusive
-                        }
-                        if choice.upper != nil {
-                                rangeInfo["upper"] = choice.upperValue
-                                rangeInfo["upperInclusive"] = choice.upperInclusive
-                        }
-                        detail["range"] = rangeInfo
-                }
-                return &PlanNode{Name: "IndexScan", Detail: detail}
-        }
-        return &PlanNode{Name: "SeqScan", Detail: detail}
+	detail := map[string]interface{}{"table": source.Table.Name}
+	if !strings.EqualFold(source.Alias, source.Table.Name) {
+		detail["alias"] = source.Alias
+	}
+	if choice != nil && choice.source == source {
+		detail["index"] = choice.info.def.Name
+		if len(choice.prefix) > 0 {
+			used := choice.info.def.Columns[:len(choice.prefix)]
+			detail["prefix"] = used
+		}
+		if choice.lower != nil || choice.upper != nil {
+			rangeInfo := map[string]interface{}{}
+			if choice.lower != nil {
+				rangeInfo["lower"] = choice.lowerValue
+				rangeInfo["lowerInclusive"] = choice.lowerInclusive
+			}
+			if choice.upper != nil {
+				rangeInfo["upper"] = choice.upperValue
+				rangeInfo["upperInclusive"] = choice.upperInclusive
+			}
+			detail["range"] = rangeInfo
+		}
+		return &PlanNode{Name: "IndexScan", Detail: detail}
+	}
+	return &PlanNode{Name: "SeqScan", Detail: detail}
 }
 
 func joinTypeString(joinType validator.JoinType) string {

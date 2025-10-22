@@ -134,6 +134,37 @@ follow an index lookup with a heap fetch to materialise result rows. `EXPLAIN`
 output includes the chosen index and any remaining predicate fragments so that
 plans are easy to inspect from the CLI.
 
+## Foreign keys
+
+Stage 5 introduces table-level and column-level foreign keys. Definitions may
+be declared inline or separately:
+
+```
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    customer_id INT REFERENCES customers(id)
+        ON DELETE RESTRICT ON UPDATE NO ACTION,
+    total DECIMAL(10,2),
+    CONSTRAINT fk_orders_customer FOREIGN KEY(customer_id)
+        REFERENCES customers(id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+```
+
+Composite keys are supported and must reference a parent primary key or unique
+index with matching column order. Unsupported referential actions surface a
+clear error (for example `referential action CASCADE is not supported (yet)`).
+
+Foreign keys are validated at creation time: GraniteDB scans the child table and
+ensures each non-NULL key points at an existing parent row. At runtime the
+executor enforces `RESTRICT`/`NO ACTION` semantics immediately:
+
+* Child inserts or updates reject keys that do not exist on the parent table.
+* Parent deletes and key updates fail while any child row references the old
+  values. When a child index exists on the foreign key columns the executor uses
+  it to probe quickly before falling back to a heap scan.
+* Child keys containing only `NULL` values are allowed.
+
 ## Known limitations
 
 * Mixing `*` with other projection expressions is not yet supported.
@@ -143,4 +174,6 @@ plans are easy to inspect from the CLI.
   sets.
 * No user-defined scalar functions beyond the listed built-ins.
 * Index selection is heuristic only and does not yet consider competing costs.
+* Foreign keys only support immediate `RESTRICT`/`NO ACTION` actions. `CASCADE`,
+  `SET NULL`, `SET DEFAULT`, and deferrable constraints remain on the roadmap.
 

@@ -20,20 +20,40 @@ const (
 
 // ColumnDef models a column definition in CREATE TABLE.
 type ColumnDef struct {
-	Name       string
-	Type       DataType
-	Length     int
-	Precision  int
-	Scale      int
-	NotNull    bool
-	PrimaryKey bool
+        Name       string
+        Type       DataType
+        Length     int
+        Precision  int
+        Scale      int
+        NotNull    bool
+        PrimaryKey bool
+}
+
+// ForeignKeyAction enumerates supported referential actions.
+type ForeignKeyAction int
+
+const (
+        ForeignKeyActionRestrict ForeignKeyAction = iota
+        ForeignKeyActionNoAction
+)
+
+// ForeignKeyDef captures a table foreign key definition.
+type ForeignKeyDef struct {
+        Name            string
+        Columns         []string
+        ReferencedTable string
+        ReferencedCols  []string
+        OnDelete        ForeignKeyAction
+        OnUpdate        ForeignKeyAction
+        Deferrable      bool
 }
 
 // CreateTableStmt represents a CREATE TABLE statement.
 type CreateTableStmt struct {
-	Name       string
-	Columns    []ColumnDef
-	PrimaryKey string
+        Name       string
+        Columns    []ColumnDef
+        PrimaryKey string
+        ForeignKeys []ForeignKeyDef
 }
 
 func (*CreateTableStmt) stmt() {}
@@ -61,6 +81,29 @@ type DropIndexStmt struct {
 }
 
 func (*DropIndexStmt) stmt() {}
+
+// UpdateAssignment describes a column assignment within an UPDATE statement.
+type UpdateAssignment struct {
+        Column string
+        Expr   Expression
+}
+
+// UpdateStmt models UPDATE table statements.
+type UpdateStmt struct {
+        Table       string
+        Assignments []UpdateAssignment
+        Where       Expression
+}
+
+func (*UpdateStmt) stmt() {}
+
+// DeleteStmt models DELETE FROM statements.
+type DeleteStmt struct {
+        Table string
+        Where Expression
+}
+
+func (*DeleteStmt) stmt() {}
 
 // InsertStmt represents INSERT INTO.
 type InsertStmt struct {

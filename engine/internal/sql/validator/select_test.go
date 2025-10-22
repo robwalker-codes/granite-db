@@ -28,7 +28,7 @@ func newTestCatalog(t *testing.T, definitions map[string][]catalog.Column) *cata
 		t.Fatalf("load catalog: %v", err)
 	}
 	for name, cols := range definitions {
-		if _, err := cat.CreateTable(name, cols, ""); err != nil {
+		if _, err := cat.CreateTable(name, cols, "", nil); err != nil {
 			t.Fatalf("create table %s: %v", name, err)
 		}
 	}
