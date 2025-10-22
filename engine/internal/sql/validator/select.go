@@ -30,28 +30,64 @@ type Ordering struct {
 
 // ValidatedSelect is the semantic representation of a SELECT statement.
 type ValidatedSelect struct {
-	Table   *catalog.Table
-	Outputs []OutputColumn
-	Filter  expr.TypedExpr
-	OrderBy *Ordering
-	Limit   *parser.LimitClause
+	Sources  []*TableSource
+	Joins    []*JoinClause
+	Bindings []ColumnBinding
+	Outputs  []OutputColumn
+	Filter   expr.TypedExpr
+	OrderBy  *Ordering
+	Limit    *parser.LimitClause
+}
+
+// TableSource captures metadata about a table referenced in the FROM clause.
+type TableSource struct {
+	Name        string
+	Alias       string
+	Table       *catalog.Table
+	ColumnStart int
+	ColumnCount int
+}
+
+// ColumnBinding describes a column available to expressions during validation.
+type ColumnBinding struct {
+	Index      int
+	TableAlias string
+	Column     catalog.Column
+}
+
+// JoinType enumerates supported join kinds at validation time.
+type JoinType int
+
+const (
+	JoinTypeInner JoinType = iota
+	JoinTypeLeft
+)
+
+// EquiCondition summarises a single equality predicate suitable for hash joins.
+type EquiCondition struct {
+	LeftColumn  int
+	RightColumn int
+	LeftOffset  int
+	RightOffset int
+}
+
+// JoinClause describes a validated join between the accumulated left side and a new right source.
+type JoinClause struct {
+	Type           JoinType
+	Condition      expr.TypedExpr
+	EquiConditions []EquiCondition
+	Residuals      []expr.TypedExpr
+	Right          *TableSource
 }
 
 // ValidateSelect analyses the parsed statement against the provided table
 // metadata and returns a typed representation suitable for planning.
-func ValidateSelect(table *catalog.Table, stmt *parser.SelectStmt) (*ValidatedSelect, error) {
-	if stmt.HasTable && table == nil {
-		return nil, fmt.Errorf("validator: table metadata is required")
-	}
-	validator := &selectValidator{
-		table:   table,
-		columns: make(map[string]int),
-	}
-	if table != nil {
-		validator.columns = make(map[string]int, len(table.Columns))
-		for idx, col := range table.Columns {
-			validator.columns[strings.ToLower(col.Name)] = idx
-		}
+func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSelect, error) {
+	validator := newSelectValidator(cat)
+
+	joins, err := validator.buildFrom(stmt.From)
+	if err != nil {
+		return nil, err
 	}
 
 	outputs, err := validator.buildOutputs(stmt.Items)
@@ -70,30 +106,289 @@ func ValidateSelect(table *catalog.Table, stmt *parser.SelectStmt) (*ValidatedSe
 		}
 	}
 
-	var orderBy *Ordering
-	if stmt.OrderBy != nil {
-		if table == nil {
-			return nil, fmt.Errorf("validator: ORDER BY requires a FROM table")
-		}
-		idx, ok := validator.columns[strings.ToLower(stmt.OrderBy.Column)]
-		if !ok {
-			return nil, fmt.Errorf("validator: unknown column %q in ORDER BY", stmt.OrderBy.Column)
-		}
-		orderBy = &Ordering{ColumnIndex: idx, Desc: stmt.OrderBy.Desc}
+	orderBy, err := validator.buildOrdering(stmt.OrderBy)
+	if err != nil {
+		return nil, err
 	}
 
 	return &ValidatedSelect{
-		Table:   table,
-		Outputs: outputs,
-		Filter:  filter,
-		OrderBy: orderBy,
-		Limit:   stmt.Limit,
+		Sources:  validator.sources(),
+		Joins:    joins,
+		Bindings: validator.bindings(),
+		Outputs:  outputs,
+		Filter:   filter,
+		OrderBy:  orderBy,
+		Limit:    stmt.Limit,
 	}, nil
 }
 
 type selectValidator struct {
-	table   *catalog.Table
-	columns map[string]int
+	catalog *catalog.Catalog
+	scope   *validationScope
+}
+
+func newSelectValidator(cat *catalog.Catalog) *selectValidator {
+	return &selectValidator{
+		catalog: cat,
+		scope:   newValidationScope(),
+	}
+}
+
+func (v *selectValidator) addTable(name, alias string) (*TableSource, error) {
+	if v.catalog == nil {
+		return nil, fmt.Errorf("validator: catalog metadata is required for table resolution")
+	}
+	table, ok := v.catalog.GetTable(name)
+	if !ok {
+		return nil, fmt.Errorf("validator: table %q not found", name)
+	}
+	return v.scope.addTable(table, alias)
+}
+
+func (v *selectValidator) sources() []*TableSource {
+	out := make([]*TableSource, len(v.scope.sources))
+	copy(out, v.scope.sources)
+	return out
+}
+
+func (v *selectValidator) bindings() []ColumnBinding {
+	return v.scope.bindings()
+}
+
+func (v *selectValidator) resolveColumn(table, name, context string) (*columnBinding, error) {
+	if len(v.scope.columns) == 0 {
+		if table != "" {
+			return nil, fmt.Errorf("validator: unknown table alias %q referenced in %s", table, context)
+		}
+		return nil, fmt.Errorf("validator: unknown column %q in %s", name, context)
+	}
+	if table != "" {
+		return v.scope.resolveByAlias(table, name, context)
+	}
+	return v.scope.resolveByName(name, context)
+}
+
+type validationScope struct {
+	sources         []*TableSource
+	aliasIndex      map[string]*TableSource
+	columns         []*columnBinding
+	columnsByName   map[string][]*columnBinding
+	columnsBySource map[*TableSource]map[string]*columnBinding
+}
+
+type columnBinding struct {
+	binding   ColumnBinding
+	source    *TableSource
+	nameLower string
+}
+
+func newValidationScope() *validationScope {
+	return &validationScope{
+		aliasIndex:      make(map[string]*TableSource),
+		columnsByName:   make(map[string][]*columnBinding),
+		columnsBySource: make(map[*TableSource]map[string]*columnBinding),
+	}
+}
+
+func (s *validationScope) addTable(table *catalog.Table, alias string) (*TableSource, error) {
+	if alias == "" {
+		alias = table.Name
+	}
+	key := strings.ToLower(alias)
+	if _, exists := s.aliasIndex[key]; exists {
+		return nil, fmt.Errorf("validator: duplicate table alias %q", alias)
+	}
+	source := &TableSource{
+		Name:        table.Name,
+		Alias:       alias,
+		Table:       table,
+		ColumnStart: len(s.columns),
+		ColumnCount: len(table.Columns),
+	}
+	columnMap := make(map[string]*columnBinding, len(table.Columns))
+	for _, col := range table.Columns {
+		binding := &columnBinding{
+			binding: ColumnBinding{
+				Index:      len(s.columns),
+				TableAlias: alias,
+				Column:     col,
+			},
+			source:    source,
+			nameLower: strings.ToLower(col.Name),
+		}
+		s.columns = append(s.columns, binding)
+		s.columnsByName[binding.nameLower] = append(s.columnsByName[binding.nameLower], binding)
+		columnMap[binding.nameLower] = binding
+	}
+	s.sources = append(s.sources, source)
+	s.aliasIndex[key] = source
+	s.columnsBySource[source] = columnMap
+	return source, nil
+}
+
+func (s *validationScope) resolveByAlias(alias, name, context string) (*columnBinding, error) {
+	source, ok := s.aliasIndex[strings.ToLower(alias)]
+	if !ok {
+		return nil, fmt.Errorf("validator: unknown table alias %q referenced in %s", alias, context)
+	}
+	column, ok := s.columnsBySource[source][strings.ToLower(name)]
+	if !ok {
+		return nil, fmt.Errorf("validator: unknown column %q on %s in %s", name, source.Alias, context)
+	}
+	return column, nil
+}
+
+func (s *validationScope) resolveByName(name, context string) (*columnBinding, error) {
+	matches := s.columnsByName[strings.ToLower(name)]
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("validator: unknown column %q in %s", name, context)
+	}
+	if len(matches) > 1 {
+		candidates := make([]string, len(matches))
+		for i, match := range matches {
+			candidates[i] = fmt.Sprintf("%s.%s", match.binding.TableAlias, match.binding.Column.Name)
+		}
+		return nil, fmt.Errorf("validator: ambiguous column %q (candidates: %s)", name, strings.Join(candidates, ", "))
+	}
+	return matches[0], nil
+}
+
+func (s *validationScope) bindings() []ColumnBinding {
+	bindings := make([]ColumnBinding, len(s.columns))
+	for i, binding := range s.columns {
+		bindings[i] = binding.binding
+	}
+	return bindings
+}
+
+func (v *selectValidator) buildFrom(node parser.TableExpr) ([]*JoinClause, error) {
+	if node == nil {
+		return nil, nil
+	}
+	switch t := node.(type) {
+	case *parser.TableName:
+		if _, err := v.addTable(t.Name, t.Alias); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	case *parser.JoinExpr:
+		joins, err := v.buildFrom(t.Left)
+		if err != nil {
+			return nil, err
+		}
+		rightTable, ok := t.Right.(*parser.TableName)
+		if !ok {
+			return nil, fmt.Errorf("validator: unsupported join operand %T", t.Right)
+		}
+		right, err := v.addTable(rightTable.Name, rightTable.Alias)
+		if err != nil {
+			return nil, err
+		}
+		condition, err := v.buildExpression(t.Condition, "JOIN condition")
+		if err != nil {
+			return nil, err
+		}
+		if condition.ResultType().Kind != expr.TypeBoolean {
+			return nil, fmt.Errorf("validator: JOIN condition must evaluate to BOOLEAN")
+		}
+		equi, residuals := v.analyseJoinCondition(condition, right)
+		join := &JoinClause{
+			Type:           mapJoinType(t.Type),
+			Condition:      condition,
+			EquiConditions: equi,
+			Residuals:      residuals,
+			Right:          right,
+		}
+		return append(joins, join), nil
+	default:
+		return nil, fmt.Errorf("validator: unsupported table expression %T", node)
+	}
+}
+
+func mapJoinType(joinType parser.JoinType) JoinType {
+	switch joinType {
+	case parser.JoinTypeLeft:
+		return JoinTypeLeft
+	default:
+		return JoinTypeInner
+	}
+}
+
+func (v *selectValidator) analyseJoinCondition(condition expr.TypedExpr, right *TableSource) ([]EquiCondition, []expr.TypedExpr) {
+	conjuncts := splitConjuncts(condition)
+	equi := make([]EquiCondition, 0, len(conjuncts))
+	residuals := make([]expr.TypedExpr, 0)
+	for _, conjunct := range conjuncts {
+		if eq, ok := v.extractEqui(conjunct, right); ok {
+			equi = append(equi, eq)
+			continue
+		}
+		residuals = append(residuals, conjunct)
+	}
+	return equi, residuals
+}
+
+func splitConjuncts(node expr.TypedExpr) []expr.TypedExpr {
+	binary, ok := node.(*expr.BinaryExpr)
+	if ok && binary.Op == expr.BinaryOpAnd {
+		left := splitConjuncts(binary.Left)
+		right := splitConjuncts(binary.Right)
+		return append(left, right...)
+	}
+	return []expr.TypedExpr{node}
+}
+
+func (v *selectValidator) extractEqui(node expr.TypedExpr, right *TableSource) (EquiCondition, bool) {
+	binary, ok := node.(*expr.BinaryExpr)
+	if !ok || binary.Op != expr.BinaryOpEqual {
+		return EquiCondition{}, false
+	}
+	leftRef, leftOK := binary.Left.(*expr.ColumnRef)
+	rightRef, rightOK := binary.Right.(*expr.ColumnRef)
+	if !leftOK || !rightOK {
+		return EquiCondition{}, false
+	}
+	rightStart := right.ColumnStart
+	rightEnd := rightStart + right.ColumnCount
+	leftIsRight := leftRef.Index >= rightStart && leftRef.Index < rightEnd
+	rightIsRight := rightRef.Index >= rightStart && rightRef.Index < rightEnd
+	if leftIsRight == rightIsRight {
+		return EquiCondition{}, false
+	}
+	eq := EquiCondition{}
+	if leftIsRight {
+		eq.LeftColumn = rightRef.Index
+		eq.RightColumn = leftRef.Index
+	} else {
+		eq.LeftColumn = leftRef.Index
+		eq.RightColumn = rightRef.Index
+	}
+	eq.LeftOffset = eq.LeftColumn
+	eq.RightOffset = eq.RightColumn - rightStart
+	if eq.RightOffset < 0 || eq.RightOffset >= right.ColumnCount {
+		return EquiCondition{}, false
+	}
+	return eq, true
+}
+
+func (v *selectValidator) buildOrdering(clause *parser.OrderByClause) (*Ordering, error) {
+	if clause == nil {
+		return nil, nil
+	}
+	if len(v.scope.columns) == 0 {
+		return nil, fmt.Errorf("validator: ORDER BY requires a FROM table")
+	}
+	qualifier := ""
+	column := clause.Column
+	if parts := strings.SplitN(column, ".", 2); len(parts) == 2 {
+		qualifier = parts[0]
+		column = parts[1]
+	}
+	binding, err := v.resolveColumn(qualifier, column, "ORDER BY")
+	if err != nil {
+		return nil, err
+	}
+	return &Ordering{ColumnIndex: binding.binding.Index, Desc: clause.Desc}, nil
 }
 
 func (v *selectValidator) buildOutputs(items []parser.SelectItem) ([]OutputColumn, error) {
@@ -102,13 +397,18 @@ func (v *selectValidator) buildOutputs(items []parser.SelectItem) ([]OutputColum
 	}
 	if len(items) == 1 {
 		if _, ok := items[0].(*parser.SelectStarItem); ok {
-			if v.table == nil {
+			if len(v.scope.sources) == 0 {
 				return nil, fmt.Errorf("validator: SELECT * requires a FROM table")
 			}
-			cols := make([]OutputColumn, len(v.table.Columns))
-			for i, col := range v.table.Columns {
-				expression := expr.NewColumnRef(i, col)
-				cols[i] = OutputColumn{Name: col.Name, Expr: expression, Type: expression.ResultType()}
+			cols := make([]OutputColumn, len(v.scope.columns))
+			includeAlias := len(v.scope.sources) > 1
+			for i, binding := range v.scope.columns {
+				expression := expr.NewColumnRef(binding.binding.Index, binding.binding.Column)
+				name := binding.binding.Column.Name
+				if includeAlias {
+					name = binding.binding.TableAlias + "." + name
+				}
+				cols[i] = OutputColumn{Name: name, Expr: expression, Type: expression.ResultType()}
 			}
 			return cols, nil
 		}
@@ -157,20 +457,11 @@ func (v *selectValidator) buildExpression(node parser.Expression, context string
 }
 
 func (v *selectValidator) buildColumnRef(ref *parser.ColumnRef, context string) (expr.TypedExpr, error) {
-	if v.table == nil {
-		if ref.Table != "" {
-			return nil, fmt.Errorf("validator: unknown table %q referenced in %s", ref.Table, context)
-		}
-		return nil, fmt.Errorf("validator: unknown column %q in %s", ref.Name, context)
+	binding, err := v.resolveColumn(ref.Table, ref.Name, context)
+	if err != nil {
+		return nil, err
 	}
-	if ref.Table != "" && !strings.EqualFold(ref.Table, v.table.Name) {
-		return nil, fmt.Errorf("validator: unknown table %q referenced in %s", ref.Table, context)
-	}
-	idx, ok := v.columns[strings.ToLower(ref.Name)]
-	if !ok {
-		return nil, fmt.Errorf("validator: unknown column %q in %s", ref.Name, context)
-	}
-	return expr.NewColumnRef(idx, v.table.Columns[idx]), nil
+	return expr.NewColumnRef(binding.binding.Index, binding.binding.Column), nil
 }
 
 func (v *selectValidator) buildLiteral(lit parser.Literal) (expr.TypedExpr, error) {

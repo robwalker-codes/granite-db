@@ -154,104 +154,315 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
-	var table *catalog.Table
-	if stmt.HasTable {
-		var ok bool
-		table, ok = e.catalog.GetTable(stmt.Table)
-		if !ok {
-			return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
-		}
-	}
-	validated, err := validator.ValidateSelect(table, stmt)
+	validated, err := validator.ValidateSelect(e.catalog, stmt)
 	if err != nil {
 		return nil, err
 	}
 
-	baseRows := make([][]interface{}, 0)
 	evaluator := newValueEvaluator()
-	if table != nil {
-		heap := storage.NewHeapFile(e.storage, table.RootPage)
-		if err := heap.Scan(func(record []byte) error {
-			values, err := DecodeRow(table.Columns, record)
-			if err != nil {
-				return err
-			}
-			evaluator.setRow(values)
-			if validated.Filter != nil {
-				filter, err := evaluator.eval(validated.Filter)
-				if err != nil {
-					return err
-				}
-				truth, err := toTruthValue(filter)
-				if err != nil {
-					return err
-				}
-				if truth != truthTrue {
-					return nil
-				}
-			}
-			clone := make([]interface{}, len(values))
-			copy(clone, values)
-			baseRows = append(baseRows, clone)
-			return nil
-		}); err != nil {
+	rows, err := e.buildFromRows(validated, evaluator)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err = e.applyFilter(rows, validated.Filter, evaluator)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.applyOrdering(rows, validated); err != nil {
+		return nil, err
+	}
+
+	rows = applyLimit(rows, validated.Limit)
+
+	projected, err := e.projectRows(rows, validated.Outputs, evaluator)
+	if err != nil {
+		return nil, err
+	}
+
+	columns := make([]string, len(validated.Outputs))
+	for i, out := range validated.Outputs {
+		columns[i] = out.Name
+	}
+
+	return &Result{Columns: columns, Rows: projected, RowsAffected: len(projected), Message: fmt.Sprintf("%d row(s)", len(projected))}, nil
+}
+
+func (e *Executor) buildFromRows(validated *validator.ValidatedSelect, evaluator *valueEvaluator) ([][]interface{}, error) {
+	if len(validated.Sources) == 0 {
+		return [][]interface{}{{nil}}, nil
+	}
+
+	leftRows, err := e.scanSourceRows(validated.Sources[0])
+	if err != nil {
+		return nil, err
+	}
+
+	for _, join := range validated.Joins {
+		rightRows, err := e.scanSourceRows(join.Right)
+		if err != nil {
 			return nil, err
 		}
-	} else {
-		evaluator.setRow(nil)
-		include := true
-		if validated.Filter != nil {
-			filter, err := evaluator.eval(validated.Filter)
-			if err != nil {
-				return nil, err
-			}
-			truth, err := toTruthValue(filter)
-			if err != nil {
-				return nil, err
-			}
-			include = truth == truthTrue
-		}
-		if include {
-			baseRows = append(baseRows, nil)
+		leftRows, err = e.executeJoin(leftRows, rightRows, join, evaluator)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	if validated.OrderBy != nil && table != nil {
-		idx := validated.OrderBy.ColumnIndex
-		column := table.Columns[idx]
-		sort.SliceStable(baseRows, func(i, j int) bool {
-			left := baseRows[i][idx]
-			right := baseRows[j][idx]
-			cmp := compareColumn(column, left, right)
-			if validated.OrderBy.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		})
-	}
+	return leftRows, nil
+}
 
-	if validated.Limit != nil {
-		offset := validated.Limit.Offset
-		if offset < 0 {
-			offset = 0
+func (e *Executor) scanSourceRows(source *validator.TableSource) ([][]interface{}, error) {
+	rows := make([][]interface{}, 0, source.Table.RowCount)
+	heap := storage.NewHeapFile(e.storage, source.Table.RootPage)
+	if err := heap.Scan(func(record []byte) error {
+		values, err := DecodeRow(source.Table.Columns, record)
+		if err != nil {
+			return err
 		}
-		if offset >= len(baseRows) {
-			baseRows = [][]interface{}{}
+		clone := make([]interface{}, len(values))
+		copy(clone, values)
+		rows = append(rows, clone)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (e *Executor) executeJoin(leftRows, rightRows [][]interface{}, join *validator.JoinClause, evaluator *valueEvaluator) ([][]interface{}, error) {
+	if len(join.EquiConditions) > 0 {
+		return e.hashJoin(leftRows, rightRows, join, evaluator)
+	}
+	return e.nestedLoopJoin(leftRows, rightRows, join, evaluator)
+}
+
+// nestedLoopJoin performs a straightforward nested loop join.
+//
+//	+-------------------+
+//	|   Left tuples     |
+//	+-------------------+
+//	      | for each
+//	      v
+//	+-------------------+
+//	|  Right scan       |
+//	+-------------------+
+//	      | evaluate ON
+//	      v
+//	+-------------------+
+//	|  Emit matches     |
+//	+-------------------+
+func (e *Executor) nestedLoopJoin(leftRows, rightRows [][]interface{}, join *validator.JoinClause, evaluator *valueEvaluator) ([][]interface{}, error) {
+	result := make([][]interface{}, 0)
+	rightWidth := join.Right.ColumnCount
+	for _, left := range leftRows {
+		matched := false
+		if len(rightRows) == 0 {
+			if join.Type == validator.JoinTypeLeft {
+				result = append(result, appendNullRight(left, rightWidth))
+			}
+			continue
+		}
+		for _, right := range rightRows {
+			combined := combineRows(left, right)
+			ok, err := e.evaluateJoinCondition(combined, join.Condition, evaluator)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				result = append(result, combined)
+				matched = true
+			}
+		}
+		if join.Type == validator.JoinTypeLeft && !matched {
+			result = append(result, appendNullRight(left, rightWidth))
+		}
+	}
+	return result, nil
+}
+
+// hashJoin builds a hash table on the right input and probes it with the left side.
+//
+//	Build phase:
+//	   right row --> hash --> bucket
+//	Probe phase:
+//	   left row  --> hash --> probe bucket --> residual filter --> emit
+func (e *Executor) hashJoin(leftRows, rightRows [][]interface{}, join *validator.JoinClause, evaluator *valueEvaluator) ([][]interface{}, error) {
+	hashTable := make(map[string][][]interface{}, len(rightRows))
+	for _, row := range rightRows {
+		key, ok := buildHashKey(row, join.EquiConditions, false)
+		if !ok {
+			continue
+		}
+		hashTable[key] = append(hashTable[key], row)
+	}
+	// TODO: implement fallback when the hash table grows beyond memory limits.
+
+	result := make([][]interface{}, 0)
+	rightWidth := join.Right.ColumnCount
+	for _, left := range leftRows {
+		key, ok := buildHashKey(left, join.EquiConditions, true)
+		matched := false
+		if ok {
+			for _, right := range hashTable[key] {
+				combined := combineRows(left, right)
+				keep, err := e.joinResidualSatisfied(combined, join.Residuals, evaluator)
+				if err != nil {
+					return nil, err
+				}
+				if keep {
+					result = append(result, combined)
+					matched = true
+				}
+			}
+		}
+		if join.Type == validator.JoinTypeLeft && !matched {
+			result = append(result, appendNullRight(left, rightWidth))
+		}
+	}
+	return result, nil
+}
+
+func buildHashKey(row []interface{}, conditions []validator.EquiCondition, leftSide bool) (string, bool) {
+	var builder strings.Builder
+	for _, cond := range conditions {
+		var value interface{}
+		if leftSide {
+			value = row[cond.LeftOffset]
 		} else {
-			baseRows = baseRows[offset:]
-			if validated.Limit.Limit < len(baseRows) {
-				baseRows = baseRows[:validated.Limit.Limit]
-			}
+			value = row[cond.RightOffset]
+		}
+		if value == nil {
+			return "", false
+		}
+		builder.WriteString(fmt.Sprintf("%T:%v|", value, value))
+	}
+	return builder.String(), true
+}
+
+func (e *Executor) joinResidualSatisfied(row []interface{}, residuals []expr.TypedExpr, evaluator *valueEvaluator) (bool, error) {
+	if len(residuals) == 0 {
+		return true, nil
+	}
+	evaluator.setRow(row)
+	for _, residual := range residuals {
+		value, err := evaluator.eval(residual)
+		if err != nil {
+			return false, err
+		}
+		truth, err := toTruthValue(value)
+		if err != nil {
+			return false, err
+		}
+		if truth != truthTrue {
+			return false, nil
 		}
 	}
+	return true, nil
+}
 
-	projector := newValueEvaluator()
-	rows := make([][]string, len(baseRows))
-	for i, values := range baseRows {
-		projector.setRow(values)
-		display := make([]string, len(validated.Outputs))
-		for j, out := range validated.Outputs {
-			value, err := projector.eval(out.Expr)
+func (e *Executor) evaluateJoinCondition(row []interface{}, condition expr.TypedExpr, evaluator *valueEvaluator) (bool, error) {
+	if condition == nil {
+		return true, nil
+	}
+	evaluator.setRow(row)
+	value, err := evaluator.eval(condition)
+	if err != nil {
+		return false, err
+	}
+	truth, err := toTruthValue(value)
+	if err != nil {
+		return false, err
+	}
+	return truth == truthTrue, nil
+}
+
+func combineRows(left, right []interface{}) []interface{} {
+	combined := make([]interface{}, len(left)+len(right))
+	copy(combined, left)
+	copy(combined[len(left):], right)
+	return combined
+}
+
+func appendNullRight(left []interface{}, rightWidth int) []interface{} {
+	combined := make([]interface{}, len(left)+rightWidth)
+	copy(combined, left)
+	for i := len(left); i < len(combined); i++ {
+		combined[i] = nil
+	}
+	return combined
+}
+
+func (e *Executor) applyFilter(rows [][]interface{}, filter expr.TypedExpr, evaluator *valueEvaluator) ([][]interface{}, error) {
+	if filter == nil {
+		return rows, nil
+	}
+	filtered := make([][]interface{}, 0, len(rows))
+	for _, row := range rows {
+		evaluator.setRow(row)
+		value, err := evaluator.eval(filter)
+		if err != nil {
+			return nil, err
+		}
+		truth, err := toTruthValue(value)
+		if err != nil {
+			return nil, err
+		}
+		if truth == truthTrue {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
+}
+
+func (e *Executor) applyOrdering(rows [][]interface{}, validated *validator.ValidatedSelect) error {
+	if validated.OrderBy == nil {
+		return nil
+	}
+	idx := validated.OrderBy.ColumnIndex
+	if idx < 0 || idx >= len(validated.Bindings) {
+		return fmt.Errorf("exec: invalid ORDER BY column index %d", idx)
+	}
+	binding := validated.Bindings[idx]
+	column := binding.Column
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := rows[i][idx]
+		right := rows[j][idx]
+		cmp := compareColumn(column, left, right)
+		if validated.OrderBy.Desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+	return nil
+}
+
+func applyLimit(rows [][]interface{}, clause *parser.LimitClause) [][]interface{} {
+	if clause == nil {
+		return rows
+	}
+	offset := clause.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(rows) {
+		return [][]interface{}{}
+	}
+	rows = rows[offset:]
+	if clause.Limit >= 0 && clause.Limit < len(rows) {
+		rows = rows[:clause.Limit]
+	}
+	return rows
+}
+
+func (e *Executor) projectRows(rows [][]interface{}, outputs []validator.OutputColumn, evaluator *valueEvaluator) ([][]string, error) {
+	projected := make([][]string, len(rows))
+	for i, row := range rows {
+		evaluator.setRow(row)
+		display := make([]string, len(outputs))
+		for j, out := range outputs {
+			value, err := evaluator.eval(out.Expr)
 			if err != nil {
 				return nil, err
 			}
@@ -261,27 +472,13 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 			}
 			display[j] = formatted
 		}
-		rows[i] = display
+		projected[i] = display
 	}
-
-	columns := make([]string, len(validated.Outputs))
-	for i, out := range validated.Outputs {
-		columns[i] = out.Name
-	}
-
-	return &Result{Columns: columns, Rows: rows, RowsAffected: len(rows), Message: fmt.Sprintf("%d row(s)", len(rows))}, nil
+	return projected, nil
 }
 
 func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
-	var table *catalog.Table
-	if stmt.HasTable {
-		var ok bool
-		table, ok = e.catalog.GetTable(stmt.Table)
-		if !ok {
-			return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
-		}
-	}
-	validated, err := validator.ValidateSelect(table, stmt)
+	validated, err := validator.ValidateSelect(e.catalog, stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -299,8 +496,13 @@ func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
 		current.Children = append(current.Children, limitNode)
 		current = limitNode
 	}
-	if validated.OrderBy != nil && table != nil {
-		orderNode := &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": table.Columns[validated.OrderBy.ColumnIndex].Name, "desc": validated.OrderBy.Desc}}
+	if validated.OrderBy != nil {
+		binding := validated.Bindings[validated.OrderBy.ColumnIndex]
+		qualified := binding.Column.Name
+		if binding.TableAlias != "" {
+			qualified = binding.TableAlias + "." + qualified
+		}
+		orderNode := &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": qualified, "desc": validated.OrderBy.Desc}}
 		current.Children = append(current.Children, orderNode)
 		current = orderNode
 	}
@@ -309,14 +511,58 @@ func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
 		current.Children = append(current.Children, filterNode)
 		current = filterNode
 	}
-	if table != nil {
-		scan := &PlanNode{Name: "SeqScan", Detail: map[string]interface{}{"table": table.Name}}
-		current.Children = append(current.Children, scan)
-	} else {
-		current.Children = append(current.Children, &PlanNode{Name: "Const"})
-	}
+	join := buildJoinPlan(validated)
+	current.Children = append(current.Children, join)
 
 	return &Plan{Root: project}, nil
+}
+
+func buildJoinPlan(validated *validator.ValidatedSelect) *PlanNode {
+	if len(validated.Sources) == 0 {
+		return &PlanNode{Name: "Const"}
+	}
+	left := planForSource(validated.Sources[0])
+	for _, join := range validated.Joins {
+		algorithm := "NestedLoopJoin"
+		if len(join.EquiConditions) > 0 {
+			algorithm = "HashJoin"
+		}
+		detail := map[string]interface{}{"type": joinTypeString(join.Type)}
+		if len(join.EquiConditions) > 0 {
+			keys := make([]string, len(join.EquiConditions))
+			for i, cond := range join.EquiConditions {
+				leftBinding := validated.Bindings[cond.LeftColumn]
+				rightBinding := validated.Bindings[cond.RightColumn]
+				keys[i] = fmt.Sprintf("%s.%s = %s.%s", leftBinding.TableAlias, leftBinding.Column.Name, rightBinding.TableAlias, rightBinding.Column.Name)
+			}
+			detail["keys"] = keys
+		}
+		if len(join.Residuals) > 0 {
+			detail["residuals"] = len(join.Residuals)
+		}
+		joinNode := &PlanNode{Name: algorithm, Detail: detail}
+		joinNode.Children = append(joinNode.Children, left)
+		joinNode.Children = append(joinNode.Children, planForSource(join.Right))
+		left = joinNode
+	}
+	return left
+}
+
+func planForSource(source *validator.TableSource) *PlanNode {
+	detail := map[string]interface{}{"table": source.Table.Name}
+	if !strings.EqualFold(source.Alias, source.Table.Name) {
+		detail["alias"] = source.Alias
+	}
+	return &PlanNode{Name: "SeqScan", Detail: detail}
+}
+
+func joinTypeString(joinType validator.JoinType) string {
+	switch joinType {
+	case validator.JoinTypeLeft:
+		return "LEFT"
+	default:
+		return "INNER"
+	}
 }
 
 func convertType(dt parser.DataType) catalog.ColumnType {

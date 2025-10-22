@@ -277,12 +277,11 @@ func (p *Parser) parseSelect() (Statement, error) {
 	stmt := &SelectStmt{Items: items}
 	if strings.ToUpper(p.curToken.Literal) == "FROM" {
 		p.nextToken()
-		if p.curToken.Type != lexer.Ident {
-			return nil, fmt.Errorf("parser: expected table name after FROM")
+		from, err := p.parseTableReference()
+		if err != nil {
+			return nil, err
 		}
-		stmt.Table = p.curToken.Literal
-		stmt.HasTable = true
-		p.nextToken()
+		stmt.From = from
 	}
 
 	if strings.ToUpper(p.curToken.Literal) == "WHERE" {
@@ -299,11 +298,10 @@ func (p *Parser) parseSelect() (Statement, error) {
 		if err := p.consumeKeyword("BY"); err != nil {
 			return nil, err
 		}
-		if p.curToken.Type != lexer.Ident {
-			return nil, fmt.Errorf("parser: expected column name after ORDER BY")
+		column, err := p.parseOrderByColumn()
+		if err != nil {
+			return nil, err
 		}
-		column := p.curToken.Literal
-		p.nextToken()
 		desc := false
 		switch strings.ToUpper(p.curToken.Literal) {
 		case "ASC":
@@ -335,6 +333,102 @@ func (p *Parser) parseSelect() (Statement, error) {
 	}
 
 	return stmt, nil
+}
+
+func (p *Parser) parseOrderByColumn() (string, error) {
+	if p.curToken.Type != lexer.Ident {
+		return "", fmt.Errorf("parser: expected column name after ORDER BY")
+	}
+	column := p.curToken.Literal
+	p.nextToken()
+	if p.curToken.Type == lexer.Dot {
+		p.nextToken()
+		if p.curToken.Type != lexer.Ident {
+			return "", fmt.Errorf("parser: expected column name after . in ORDER BY")
+		}
+		column = column + "." + p.curToken.Literal
+		p.nextToken()
+	}
+	return column, nil
+}
+
+func (p *Parser) parseTableReference() (TableExpr, error) {
+	left, err := p.parseTableFactor()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		joinType, ok, err := p.parseJoinType()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		right, err := p.parseTableFactor()
+		if err != nil {
+			return nil, err
+		}
+		if strings.ToUpper(p.curToken.Literal) == "USING" {
+			return nil, fmt.Errorf("parser: USING is not supported for joins")
+		}
+		if err := p.consumeKeyword("ON"); err != nil {
+			return nil, err
+		}
+		condition, err := p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		left = &JoinExpr{Left: left, Right: right, Type: joinType, Condition: condition}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseTableFactor() (TableExpr, error) {
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected table name in FROM clause")
+	}
+	name := p.curToken.Literal
+	p.nextToken()
+	alias := ""
+	switch {
+	case strings.ToUpper(p.curToken.Literal) == "AS":
+		p.nextToken()
+		if p.curToken.Type != lexer.Ident {
+			return nil, fmt.Errorf("parser: expected alias after AS")
+		}
+		alias = p.curToken.Literal
+		p.nextToken()
+	case p.curToken.Type == lexer.Ident && !isAliasTerminator(strings.ToUpper(p.curToken.Literal)):
+		alias = p.curToken.Literal
+		p.nextToken()
+	}
+	return &TableName{Name: name, Alias: alias}, nil
+}
+
+func (p *Parser) parseJoinType() (JoinType, bool, error) {
+	switch strings.ToUpper(p.curToken.Literal) {
+	case "JOIN":
+		p.nextToken()
+		return JoinTypeInner, true, nil
+	case "INNER":
+		p.nextToken()
+		if err := p.consumeKeyword("JOIN"); err != nil {
+			return 0, false, err
+		}
+		return JoinTypeInner, true, nil
+	case "LEFT":
+		p.nextToken()
+		if strings.ToUpper(p.curToken.Literal) == "OUTER" {
+			p.nextToken()
+		}
+		if err := p.consumeKeyword("JOIN"); err != nil {
+			return 0, false, err
+		}
+		return JoinTypeLeft, true, nil
+	default:
+		return 0, false, nil
+	}
 }
 
 func (p *Parser) parseSelectItems() ([]SelectItem, error) {
@@ -747,7 +841,7 @@ func (p *Parser) curPrecedence() int {
 
 func isAliasTerminator(lit string) bool {
 	switch lit {
-	case "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET", "ASC", "DESC", "AND", "OR":
+	case "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET", "ASC", "DESC", "AND", "OR", "JOIN", "INNER", "LEFT", "OUTER", "ON", "USING":
 		return true
 	default:
 		return false

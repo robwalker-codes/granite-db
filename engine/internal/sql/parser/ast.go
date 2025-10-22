@@ -52,12 +52,11 @@ func (*InsertStmt) stmt() {}
 
 // SelectStmt models SELECT queries with optional clauses.
 type SelectStmt struct {
-	Table    string
-	HasTable bool
-	Items    []SelectItem
-	Where    Expression
-	OrderBy  *OrderByClause
-	Limit    *LimitClause
+	From    TableExpr
+	Items   []SelectItem
+	Where   Expression
+	OrderBy *OrderByClause
+	Limit   *LimitClause
 }
 
 func (*SelectStmt) stmt() {}
@@ -79,6 +78,37 @@ func (*SelectExprItem) selectItem() {}
 type SelectStarItem struct{}
 
 func (*SelectStarItem) selectItem() {}
+
+// TableExpr represents a table expression in the FROM clause.
+type TableExpr interface {
+	tableExpr()
+}
+
+// TableName identifies a base table optionally referenced with an alias.
+type TableName struct {
+	Name  string
+	Alias string
+}
+
+func (*TableName) tableExpr() {}
+
+// JoinType enumerates supported join kinds.
+type JoinType int
+
+const (
+	JoinTypeInner JoinType = iota
+	JoinTypeLeft
+)
+
+// JoinExpr models a binary join between two table expressions.
+type JoinExpr struct {
+	Left      TableExpr
+	Right     TableExpr
+	Type      JoinType
+	Condition Expression
+}
+
+func (*JoinExpr) tableExpr() {}
 
 // LiteralKind identifies literal types.
 type LiteralKind int
