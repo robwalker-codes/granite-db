@@ -11,6 +11,7 @@ type DataType int
 const (
 	DataTypeInt DataType = iota
 	DataTypeBigInt
+	DataTypeDecimal
 	DataTypeVarChar
 	DataTypeBoolean
 	DataTypeDate
@@ -19,10 +20,13 @@ const (
 
 // ColumnDef models a column definition in CREATE TABLE.
 type ColumnDef struct {
-	Name    string
-	Type    DataType
-	Length  int
-	NotNull bool
+	Name       string
+	Type       DataType
+	Length     int
+	Precision  int
+	Scale      int
+	NotNull    bool
+	PrimaryKey bool
 }
 
 // CreateTableStmt represents a CREATE TABLE statement.
@@ -55,7 +59,9 @@ type SelectStmt struct {
 	From    TableExpr
 	Items   []SelectItem
 	Where   Expression
-	OrderBy *OrderByClause
+	GroupBy []Expression
+	Having  Expression
+	OrderBy []*OrderByExpr
 	Limit   *LimitClause
 }
 
@@ -197,11 +203,17 @@ func (*BinaryExpr) expr() {}
 
 // FunctionCallExpr captures function invocations.
 type FunctionCallExpr struct {
-	Name string
-	Args []Expression
+	Name     string
+	Args     []Expression
+	Distinct bool
 }
 
 func (*FunctionCallExpr) expr() {}
+
+// StarExpr represents the * token in contexts such as COUNT(*).
+type StarExpr struct{}
+
+func (*StarExpr) expr() {}
 
 // IsNullExpr tests whether the operand is NULL, optionally negated.
 type IsNullExpr struct {
@@ -211,10 +223,10 @@ type IsNullExpr struct {
 
 func (*IsNullExpr) expr() {}
 
-// OrderByClause describes an ORDER BY specification.
-type OrderByClause struct {
-	Column string
-	Desc   bool
+// OrderByExpr describes an ORDER BY specification.
+type OrderByExpr struct {
+	Expr Expression
+	Desc bool
 }
 
 // LimitClause captures LIMIT/OFFSET information.

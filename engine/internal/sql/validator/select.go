@@ -22,21 +22,52 @@ type OutputColumn struct {
 	Type expr.Type
 }
 
-// Ordering captures ORDER BY information following validation.
-type Ordering struct {
-	ColumnIndex int
-	Desc        bool
-}
-
 // ValidatedSelect is the semantic representation of a SELECT statement.
 type ValidatedSelect struct {
-	Sources  []*TableSource
-	Joins    []*JoinClause
-	Bindings []ColumnBinding
-	Outputs  []OutputColumn
-	Filter   expr.TypedExpr
-	OrderBy  *Ordering
-	Limit    *parser.LimitClause
+	Sources    []*TableSource
+	Joins      []*JoinClause
+	Bindings   []ColumnBinding
+	Outputs    []OutputColumn
+	Filter     expr.TypedExpr
+	Groupings  []Grouping
+	Aggregates []AggregateDefinition
+	Having     expr.TypedExpr
+	OrderBy    []OrderingTerm
+	Limit      *parser.LimitClause
+}
+
+// OrderingTerm captures a single ORDER BY expression.
+type OrderingTerm struct {
+	Expr expr.TypedExpr
+	Desc bool
+	Text string
+}
+
+// Grouping records a GROUP BY expression for downstream planning.
+type Grouping struct {
+	Expr expr.TypedExpr
+	Text string
+}
+
+// AggregateFunction identifies supported aggregate kinds.
+type AggregateFunction int
+
+const (
+	AggregateCountStar AggregateFunction = iota
+	AggregateCount
+	AggregateSum
+	AggregateAvg
+	AggregateMin
+	AggregateMax
+)
+
+// AggregateDefinition describes an aggregate to compute during execution.
+type AggregateDefinition struct {
+	Func       AggregateFunction
+	Name       string
+	Arg        expr.TypedExpr
+	ResultType expr.Type
+	InputType  expr.Type
 }
 
 // TableSource captures metadata about a table referenced in the FROM clause.
@@ -90,9 +121,52 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		return nil, err
 	}
 
-	outputs, err := validator.buildOutputs(stmt.Items)
+	groupingInfo, err := validator.buildGroupings(stmt.GroupBy)
 	if err != nil {
 		return nil, err
+	}
+
+	aggregated := len(groupingInfo.expressions) > 0 || containsAggregates(stmt.Items, stmt.Having, stmt.OrderBy)
+
+	var (
+		outputs    []OutputColumn
+		aggregates []AggregateDefinition
+		having     expr.TypedExpr
+		orderBy    []OrderingTerm
+	)
+
+	if aggregated {
+		builder := newAggregateBuilder(validator, groupingInfo)
+		outputs, err = validator.buildAggregatedOutputs(stmt.Items, builder)
+		if err != nil {
+			return nil, err
+		}
+		if stmt.Having != nil {
+			having, err = builder.buildExpression(stmt.Having, "HAVING clause")
+			if err != nil {
+				return nil, err
+			}
+			if having.ResultType().Kind != expr.TypeBoolean && having.ResultType().Kind != expr.TypeNull {
+				return nil, fmt.Errorf("validator: HAVING clause must evaluate to BOOLEAN")
+			}
+		}
+		orderBy, err = validator.buildAggregatedOrdering(stmt.OrderBy, builder, outputs)
+		if err != nil {
+			return nil, err
+		}
+		aggregates = builder.definitions()
+	} else {
+		if stmt.Having != nil {
+			return nil, fmt.Errorf("validator: HAVING requires aggregates or GROUP BY")
+		}
+		outputs, err = validator.buildScalarOutputs(stmt.Items)
+		if err != nil {
+			return nil, err
+		}
+		orderBy, err = validator.buildScalarOrdering(stmt.OrderBy, outputs)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var filter expr.TypedExpr
@@ -106,19 +180,17 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		}
 	}
 
-	orderBy, err := validator.buildOrdering(stmt.OrderBy)
-	if err != nil {
-		return nil, err
-	}
-
 	return &ValidatedSelect{
-		Sources:  validator.sources(),
-		Joins:    joins,
-		Bindings: validator.bindings(),
-		Outputs:  outputs,
-		Filter:   filter,
-		OrderBy:  orderBy,
-		Limit:    stmt.Limit,
+		Sources:    validator.sources(),
+		Joins:      joins,
+		Bindings:   validator.bindings(),
+		Outputs:    outputs,
+		Filter:     filter,
+		Groupings:  groupingInfo.toGroupings(),
+		Aggregates: aggregates,
+		Having:     having,
+		OrderBy:    orderBy,
+		Limit:      stmt.Limit,
 	}, nil
 }
 
@@ -134,6 +206,90 @@ func newSelectValidator(cat *catalog.Catalog) *selectValidator {
 	}
 }
 
+func containsAggregates(items []parser.SelectItem, having parser.Expression, order []*parser.OrderByExpr) bool {
+	for _, item := range items {
+		if exprItem, ok := item.(*parser.SelectExprItem); ok {
+			if expressionContainsAggregate(exprItem.Expr) {
+				return true
+			}
+		}
+	}
+	if having != nil && expressionContainsAggregate(having) {
+		return true
+	}
+	for _, clause := range order {
+		if clause != nil && expressionContainsAggregate(clause.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func expressionContainsAggregate(node parser.Expression) bool {
+	switch e := node.(type) {
+	case *parser.FunctionCallExpr:
+		name := strings.ToUpper(e.Name)
+		if isAggregateFunction(name) {
+			return true
+		}
+		for _, arg := range e.Args {
+			if expressionContainsAggregate(arg) {
+				return true
+			}
+		}
+		return false
+	case *parser.UnaryExpr:
+		return expressionContainsAggregate(e.Expr)
+	case *parser.BinaryExpr:
+		if expressionContainsAggregate(e.Left) {
+			return true
+		}
+		return expressionContainsAggregate(e.Right)
+	case *parser.IsNullExpr:
+		return expressionContainsAggregate(e.Expr)
+	default:
+		return false
+	}
+}
+
+type groupingInfo struct {
+	expressions []expr.TypedExpr
+	texts       []string
+	indexByText map[string]int
+	columnIndex map[int]int
+}
+
+func (g *groupingInfo) toGroupings() []Grouping {
+	if g == nil || len(g.expressions) == 0 {
+		return nil
+	}
+	result := make([]Grouping, len(g.expressions))
+	for i, exp := range g.expressions {
+		result[i] = Grouping{Expr: exp, Text: g.texts[i]}
+	}
+	return result
+}
+
+func (g *groupingInfo) lookupExpression(node parser.Expression) (int, bool) {
+	if g == nil {
+		return 0, false
+	}
+	if g.indexByText == nil {
+		return 0, false
+	}
+	text := parser.FormatExpression(node)
+	idx, ok := g.indexByText[text]
+	return idx, ok
+}
+
+func (g *groupingInfo) groupIndexForColumn(idx int) (int, bool) {
+	if g == nil {
+		return 0, false
+	}
+	value, ok := g.columnIndex[idx]
+	return value, ok
+}
+
 func (v *selectValidator) addTable(name, alias string) (*TableSource, error) {
 	if v.catalog == nil {
 		return nil, fmt.Errorf("validator: catalog metadata is required for table resolution")
@@ -143,6 +299,29 @@ func (v *selectValidator) addTable(name, alias string) (*TableSource, error) {
 		return nil, fmt.Errorf("validator: table %q not found", name)
 	}
 	return v.scope.addTable(table, alias)
+}
+
+func (v *selectValidator) buildGroupings(nodes []parser.Expression) (*groupingInfo, error) {
+	info := &groupingInfo{
+		expressions: make([]expr.TypedExpr, 0, len(nodes)),
+		texts:       make([]string, 0, len(nodes)),
+		indexByText: make(map[string]int),
+		columnIndex: make(map[int]int),
+	}
+	for i, node := range nodes {
+		typed, err := v.buildExpression(node, "GROUP BY")
+		if err != nil {
+			return nil, err
+		}
+		info.expressions = append(info.expressions, typed)
+		text := parser.FormatExpression(node)
+		info.texts = append(info.texts, text)
+		info.indexByText[text] = i
+		if column, ok := typed.(*expr.ColumnRef); ok {
+			info.columnIndex[column.Index] = i
+		}
+	}
+	return info, nil
 }
 
 func (v *selectValidator) sources() []*TableSource {
@@ -371,27 +550,7 @@ func (v *selectValidator) extractEqui(node expr.TypedExpr, right *TableSource) (
 	return eq, true
 }
 
-func (v *selectValidator) buildOrdering(clause *parser.OrderByClause) (*Ordering, error) {
-	if clause == nil {
-		return nil, nil
-	}
-	if len(v.scope.columns) == 0 {
-		return nil, fmt.Errorf("validator: ORDER BY requires a FROM table")
-	}
-	qualifier := ""
-	column := clause.Column
-	if parts := strings.SplitN(column, ".", 2); len(parts) == 2 {
-		qualifier = parts[0]
-		column = parts[1]
-	}
-	binding, err := v.resolveColumn(qualifier, column, "ORDER BY")
-	if err != nil {
-		return nil, err
-	}
-	return &Ordering{ColumnIndex: binding.binding.Index, Desc: clause.Desc}, nil
-}
-
-func (v *selectValidator) buildOutputs(items []parser.SelectItem) ([]OutputColumn, error) {
+func (v *selectValidator) buildScalarOutputs(items []parser.SelectItem) ([]OutputColumn, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("validator: SELECT list cannot be empty")
 	}
@@ -433,6 +592,93 @@ func (v *selectValidator) buildOutputs(items []parser.SelectItem) ([]OutputColum
 	return outputs, nil
 }
 
+func (v *selectValidator) buildAggregatedOutputs(items []parser.SelectItem, builder *aggregateBuilder) ([]OutputColumn, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("validator: SELECT list cannot be empty")
+	}
+	if len(items) == 1 {
+		if _, ok := items[0].(*parser.SelectStarItem); ok {
+			return nil, fmt.Errorf("validator: SELECT * is not supported with aggregates")
+		}
+	}
+
+	outputs := make([]OutputColumn, 0, len(items))
+	for _, item := range items {
+		exprItem, ok := item.(*parser.SelectExprItem)
+		if !ok {
+			return nil, fmt.Errorf("validator: SELECT * cannot be combined with expressions (yet)")
+		}
+		typed, err := builder.buildExpression(exprItem.Expr, "SELECT list")
+		if err != nil {
+			return nil, err
+		}
+		name := exprItem.Alias
+		if name == "" {
+			name = parser.FormatExpression(exprItem.Expr)
+		}
+		outputs = append(outputs, OutputColumn{Name: name, Expr: typed, Type: typed.ResultType()})
+	}
+	return outputs, nil
+}
+
+func (v *selectValidator) buildScalarOrdering(clauses []*parser.OrderByExpr, outputs []OutputColumn) ([]OrderingTerm, error) {
+	if len(clauses) == 0 {
+		return nil, nil
+	}
+	aliasMap := make(map[string]expr.TypedExpr, len(outputs))
+	for _, out := range outputs {
+		aliasMap[strings.ToLower(out.Name)] = out.Expr
+	}
+	terms := make([]OrderingTerm, 0, len(clauses))
+	for _, clause := range clauses {
+		text := parser.FormatExpression(clause.Expr)
+		var termExpr expr.TypedExpr
+		if col, ok := clause.Expr.(*parser.ColumnRef); ok && col.Table == "" {
+			if aliasExpr, exists := aliasMap[strings.ToLower(col.Name)]; exists {
+				termExpr = aliasExpr
+			}
+		}
+		if termExpr == nil {
+			var err error
+			termExpr, err = v.buildExpression(clause.Expr, "ORDER BY")
+			if err != nil {
+				return nil, err
+			}
+		}
+		terms = append(terms, OrderingTerm{Expr: termExpr, Desc: clause.Desc, Text: text})
+	}
+	return terms, nil
+}
+
+func (v *selectValidator) buildAggregatedOrdering(clauses []*parser.OrderByExpr, builder *aggregateBuilder, outputs []OutputColumn) ([]OrderingTerm, error) {
+	if len(clauses) == 0 {
+		return nil, nil
+	}
+	aliasMap := make(map[string]expr.TypedExpr, len(outputs))
+	for _, out := range outputs {
+		aliasMap[strings.ToLower(out.Name)] = out.Expr
+	}
+	terms := make([]OrderingTerm, 0, len(clauses))
+	for _, clause := range clauses {
+		text := parser.FormatExpression(clause.Expr)
+		var termExpr expr.TypedExpr
+		if col, ok := clause.Expr.(*parser.ColumnRef); ok && col.Table == "" {
+			if aliasExpr, exists := aliasMap[strings.ToLower(col.Name)]; exists {
+				termExpr = aliasExpr
+			}
+		}
+		if termExpr == nil {
+			var err error
+			termExpr, err = builder.buildExpression(clause.Expr, "ORDER BY")
+			if err != nil {
+				return nil, err
+			}
+		}
+		terms = append(terms, OrderingTerm{Expr: termExpr, Desc: clause.Desc, Text: text})
+	}
+	return terms, nil
+}
+
 func (v *selectValidator) buildExpression(node parser.Expression, context string) (expr.TypedExpr, error) {
 	switch e := node.(type) {
 	case *parser.ColumnRef:
@@ -453,6 +699,215 @@ func (v *selectValidator) buildExpression(node parser.Expression, context string
 		return &expr.IsNullExpr{Expr: operand, Negated: e.Negated}, nil
 	default:
 		return nil, fmt.Errorf("validator: unsupported expression %T", node)
+	}
+}
+
+type aggregateBuilder struct {
+	validator      *selectValidator
+	grouping       *groupingInfo
+	aggregates     []AggregateDefinition
+	aggregateIndex map[string]int
+}
+
+func newAggregateBuilder(v *selectValidator, grouping *groupingInfo) *aggregateBuilder {
+	return &aggregateBuilder{
+		validator:      v,
+		grouping:       grouping,
+		aggregateIndex: make(map[string]int),
+	}
+}
+
+func (b *aggregateBuilder) definitions() []AggregateDefinition {
+	defs := make([]AggregateDefinition, len(b.aggregates))
+	copy(defs, b.aggregates)
+	return defs
+}
+
+func (b *aggregateBuilder) buildExpression(node parser.Expression, context string) (expr.TypedExpr, error) {
+	if idx, ok := b.grouping.lookupExpression(node); ok {
+		typ := b.grouping.expressions[idx].ResultType()
+		return expr.NewGroupRef(idx, typ), nil
+	}
+	switch e := node.(type) {
+	case *parser.ColumnRef:
+		return b.buildColumnRef(e, context)
+	case *parser.LiteralExpr:
+		return b.validator.buildLiteral(e.Literal)
+	case *parser.UnaryExpr:
+		operand, err := b.buildExpression(e.Expr, context)
+		if err != nil {
+			return nil, err
+		}
+		return b.validator.makeUnary(e.Op, operand)
+	case *parser.BinaryExpr:
+		left, err := b.buildExpression(e.Left, context)
+		if err != nil {
+			return nil, err
+		}
+		right, err := b.buildExpression(e.Right, context)
+		if err != nil {
+			return nil, err
+		}
+		return b.validator.makeBinary(e.Op, left, right)
+	case *parser.FunctionCallExpr:
+		name := strings.ToUpper(e.Name)
+		if isAggregateFunction(name) {
+			return b.registerAggregate(name, e, context)
+		}
+		if e.Distinct {
+			return nil, fmt.Errorf("validator: DISTINCT is only supported in aggregate functions")
+		}
+		args := make([]expr.TypedExpr, len(e.Args))
+		for i, arg := range e.Args {
+			typed, err := b.buildExpression(arg, context)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = typed
+		}
+		return b.validator.makeScalarFunction(name, args, context)
+	case *parser.IsNullExpr:
+		operand, err := b.buildExpression(e.Expr, context)
+		if err != nil {
+			return nil, err
+		}
+		return &expr.IsNullExpr{Expr: operand, Negated: e.Negated}, nil
+	default:
+		return nil, fmt.Errorf("validator: unsupported expression %T", node)
+	}
+}
+
+func (b *aggregateBuilder) buildColumnRef(ref *parser.ColumnRef, context string) (expr.TypedExpr, error) {
+	binding, err := b.validator.resolveColumn(ref.Table, ref.Name, context)
+	if err != nil {
+		return nil, err
+	}
+	idx, ok := b.grouping.groupIndexForColumn(binding.binding.Index)
+	if !ok {
+		return nil, fmt.Errorf("validator: column/expression not grouped: %s", parser.FormatExpression(ref))
+	}
+	typ := b.grouping.expressions[idx].ResultType()
+	return expr.NewGroupRef(idx, typ), nil
+}
+
+func (b *aggregateBuilder) registerAggregate(name string, fn *parser.FunctionCallExpr, context string) (expr.TypedExpr, error) {
+	if fn.Distinct {
+		return nil, fmt.Errorf("validator: DISTINCT is not supported in aggregate functions")
+	}
+	keyArg := ""
+	var arg expr.TypedExpr
+	var err error
+	if len(fn.Args) == 0 {
+		return nil, fmt.Errorf("validator: %s expects an argument", name)
+	}
+	if len(fn.Args) > 1 {
+		return nil, fmt.Errorf("validator: %s expects exactly 1 argument", name)
+	}
+	if _, isStar := fn.Args[0].(*parser.StarExpr); isStar {
+		keyArg = "*"
+		if name != "COUNT" {
+			return nil, fmt.Errorf("validator: %s does not support * argument", name)
+		}
+	} else {
+		arg, err = b.validator.buildExpression(fn.Args[0], context)
+		if err != nil {
+			return nil, err
+		}
+		keyArg = parser.FormatExpression(fn.Args[0])
+	}
+
+	signature := name + ":" + keyArg
+	if idx, exists := b.aggregateIndex[signature]; exists {
+		typ := b.aggregates[idx].ResultType
+		offset := len(b.grouping.expressions)
+		return expr.NewAggregateRef(offset+idx, typ), nil
+	}
+
+	def, err := b.createAggregateDefinition(name, fn, arg)
+	if err != nil {
+		return nil, err
+	}
+
+	idx := len(b.aggregates)
+	b.aggregateIndex[signature] = idx
+	b.aggregates = append(b.aggregates, def)
+	offset := len(b.grouping.expressions)
+	return expr.NewAggregateRef(offset+idx, def.ResultType), nil
+}
+
+func (b *aggregateBuilder) createAggregateDefinition(name string, call *parser.FunctionCallExpr, arg expr.TypedExpr) (AggregateDefinition, error) {
+	upper := strings.ToUpper(name)
+	definition := AggregateDefinition{Name: parser.FormatExpression(call)}
+	switch upper {
+	case "COUNT":
+		if len(call.Args) == 1 {
+			if _, isStar := call.Args[0].(*parser.StarExpr); isStar {
+				definition.Func = AggregateCountStar
+				definition.ResultType = expr.BigIntType(false)
+				return definition, nil
+			}
+		}
+		definition.Func = AggregateCount
+		if arg != nil {
+			definition.Arg = arg
+			definition.InputType = arg.ResultType()
+		}
+		definition.ResultType = expr.BigIntType(false)
+		return definition, nil
+	case "SUM":
+		if arg == nil {
+			return AggregateDefinition{}, fmt.Errorf("validator: SUM expects an argument")
+		}
+		result, err := deriveSumType(arg.ResultType())
+		if err != nil {
+			return AggregateDefinition{}, err
+		}
+		definition.Func = AggregateSum
+		definition.Arg = arg
+		definition.InputType = arg.ResultType()
+		definition.ResultType = result
+		return definition, nil
+	case "AVG":
+		if arg == nil {
+			return AggregateDefinition{}, fmt.Errorf("validator: AVG expects an argument")
+		}
+		result, err := deriveAvgType(arg.ResultType())
+		if err != nil {
+			return AggregateDefinition{}, err
+		}
+		definition.Func = AggregateAvg
+		definition.Arg = arg
+		definition.InputType = arg.ResultType()
+		definition.ResultType = result
+		return definition, nil
+	case "MIN":
+		if arg == nil {
+			return AggregateDefinition{}, fmt.Errorf("validator: MIN expects an argument")
+		}
+		result, err := deriveMinMaxType(arg.ResultType(), "MIN")
+		if err != nil {
+			return AggregateDefinition{}, err
+		}
+		definition.Func = AggregateMin
+		definition.Arg = arg
+		definition.InputType = arg.ResultType()
+		definition.ResultType = result
+		return definition, nil
+	case "MAX":
+		if arg == nil {
+			return AggregateDefinition{}, fmt.Errorf("validator: MAX expects an argument")
+		}
+		result, err := deriveMinMaxType(arg.ResultType(), "MAX")
+		if err != nil {
+			return AggregateDefinition{}, err
+		}
+		definition.Func = AggregateMax
+		definition.Arg = arg
+		definition.InputType = arg.ResultType()
+		definition.ResultType = result
+		return definition, nil
+	default:
+		return AggregateDefinition{}, fmt.Errorf("validator: unknown aggregate function %s", name)
 	}
 }
 
@@ -525,8 +980,43 @@ func (v *selectValidator) buildUnary(node *parser.UnaryExpr, context string) (ex
 	if err != nil {
 		return nil, err
 	}
+	return v.makeUnary(node.Op, operand)
+}
+
+func (v *selectValidator) buildBinary(node *parser.BinaryExpr, context string) (expr.TypedExpr, error) {
+	left, err := v.buildExpression(node.Left, context)
+	if err != nil {
+		return nil, err
+	}
+	right, err := v.buildExpression(node.Right, context)
+	if err != nil {
+		return nil, err
+	}
+	return v.makeBinary(node.Op, left, right)
+}
+
+func (v *selectValidator) buildFunction(fn *parser.FunctionCallExpr, context string) (expr.TypedExpr, error) {
+	name := strings.ToUpper(fn.Name)
+	if isAggregateFunction(name) {
+		return nil, fmt.Errorf("validator: aggregate function %s is not allowed in %s", name, context)
+	}
+	if fn.Distinct {
+		return nil, fmt.Errorf("validator: DISTINCT is only supported in aggregate functions")
+	}
+	args := make([]expr.TypedExpr, len(fn.Args))
+	for i, arg := range fn.Args {
+		typed, err := v.buildExpression(arg, context)
+		if err != nil {
+			return nil, err
+		}
+		args[i] = typed
+	}
+	return v.makeScalarFunction(name, args, context)
+}
+
+func (v *selectValidator) makeUnary(op parser.UnaryOp, operand expr.TypedExpr) (expr.TypedExpr, error) {
 	typ := operand.ResultType()
-	switch node.Op {
+	switch op {
 	case parser.UnaryPlus:
 		if !typ.IsNumeric() && typ.Kind != expr.TypeNull {
 			return nil, fmt.Errorf("validator: unary + requires numeric operand")
@@ -543,44 +1033,36 @@ func (v *selectValidator) buildUnary(node *parser.UnaryExpr, context string) (ex
 		}
 		return expr.NewUnary(expr.UnaryOpNot, operand, expr.BooleanType(true)), nil
 	default:
-		return nil, fmt.Errorf("validator: unsupported unary operator %s", node.Op)
+		return nil, fmt.Errorf("validator: unsupported unary operator %s", op)
 	}
 }
 
-func (v *selectValidator) buildBinary(node *parser.BinaryExpr, context string) (expr.TypedExpr, error) {
-	left, err := v.buildExpression(node.Left, context)
-	if err != nil {
-		return nil, err
-	}
-	right, err := v.buildExpression(node.Right, context)
-	if err != nil {
-		return nil, err
-	}
+func (v *selectValidator) makeBinary(op parser.BinaryOp, left, right expr.TypedExpr) (expr.TypedExpr, error) {
 	leftType := left.ResultType()
 	rightType := right.ResultType()
-	switch node.Op {
+	switch op {
 	case parser.BinaryAdd, parser.BinarySubtract, parser.BinaryMultiply, parser.BinaryDivide, parser.BinaryModulo:
 		resultType, err := promoteNumeric(leftType, rightType)
 		if err != nil {
 			return nil, err
 		}
-		if node.Op == parser.BinaryDivide {
+		if op == parser.BinaryDivide {
 			if resultType.Kind != expr.TypeDecimal {
 				scale := maxScale(leftType, rightType) + 6
 				precision := scale + 18
 				resultType = expr.DecimalType(resultType.Nullable, precision, scale)
 			}
 		}
-		if node.Op == parser.BinaryModulo && resultType.Kind == expr.TypeDecimal {
+		if op == parser.BinaryModulo && resultType.Kind == expr.TypeDecimal {
 			return nil, fmt.Errorf("validator: modulo is only supported for integral types")
 		}
-		return expr.NewBinary(left, right, mapArithmeticOp(node.Op), resultType), nil
+		return expr.NewBinary(left, right, mapArithmeticOp(op), resultType), nil
 	case parser.BinaryEqual, parser.BinaryNotEqual, parser.BinaryLess, parser.BinaryLessEqual, parser.BinaryGreater, parser.BinaryGreaterEqual:
 		if err := ensureComparable(leftType, rightType); err != nil {
 			return nil, err
 		}
 		nullable := leftType.Nullable || rightType.Nullable || leftType.Kind == expr.TypeNull || rightType.Kind == expr.TypeNull
-		return expr.NewBinary(left, right, mapComparisonOp(node.Op), expr.BooleanType(nullable)), nil
+		return expr.NewBinary(left, right, mapComparisonOp(op), expr.BooleanType(nullable)), nil
 	case parser.BinaryAnd, parser.BinaryOr:
 		if err := ensureBoolean(leftType); err != nil {
 			return nil, err
@@ -588,61 +1070,44 @@ func (v *selectValidator) buildBinary(node *parser.BinaryExpr, context string) (
 		if err := ensureBoolean(rightType); err != nil {
 			return nil, err
 		}
-		op := mapBooleanOp(node.Op)
-		return expr.NewBinary(left, right, op, expr.BooleanType(true)), nil
+		mapped := mapBooleanOp(op)
+		return expr.NewBinary(left, right, mapped, expr.BooleanType(true)), nil
 	default:
-		return nil, fmt.Errorf("validator: unsupported binary operator %s", node.Op)
+		return nil, fmt.Errorf("validator: unsupported binary operator %s", op)
 	}
 }
 
-func (v *selectValidator) buildFunction(fn *parser.FunctionCallExpr, context string) (expr.TypedExpr, error) {
-	name := strings.ToUpper(fn.Name)
+func (v *selectValidator) makeScalarFunction(name string, args []expr.TypedExpr, context string) (expr.TypedExpr, error) {
 	switch name {
 	case "LOWER", "UPPER":
-		if len(fn.Args) != 1 {
+		if len(args) != 1 {
 			return nil, fmt.Errorf("validator: %s expects exactly 1 argument", name)
 		}
-		arg, err := v.buildExpression(fn.Args[0], context)
-		if err != nil {
-			return nil, err
-		}
-		argType := arg.ResultType()
+		argType := args[0].ResultType()
 		if !argType.IsString() && argType.Kind != expr.TypeNull {
 			return nil, fmt.Errorf("validator: function %s expects VARCHAR argument but received %s", name, describeType(argType))
 		}
-		return expr.NewFunction(name, []expr.TypedExpr{arg}, expr.VarCharType(argType.Nullable || argType.Kind == expr.TypeNull, argType.Length)), nil
+		return expr.NewFunction(name, args, expr.VarCharType(argType.Nullable || argType.Kind == expr.TypeNull, argType.Length)), nil
 	case "LENGTH":
-		if len(fn.Args) != 1 {
+		if len(args) != 1 {
 			return nil, fmt.Errorf("validator: LENGTH expects exactly 1 argument")
 		}
-		arg, err := v.buildExpression(fn.Args[0], context)
-		if err != nil {
-			return nil, err
-		}
-		argType := arg.ResultType()
+		argType := args[0].ResultType()
 		if !argType.IsString() && argType.Kind != expr.TypeNull {
 			return nil, fmt.Errorf("validator: function LENGTH expects VARCHAR argument but received %s", describeType(argType))
 		}
-		return expr.NewFunction(name, []expr.TypedExpr{arg}, expr.IntType(argType.Nullable || argType.Kind == expr.TypeNull)), nil
+		return expr.NewFunction(name, args, expr.IntType(argType.Nullable || argType.Kind == expr.TypeNull)), nil
 	case "COALESCE":
-		if len(fn.Args) != 2 {
+		if len(args) != 2 {
 			return nil, fmt.Errorf("validator: COALESCE expects exactly 2 arguments")
 		}
-		left, err := v.buildExpression(fn.Args[0], context)
+		resultType, err := coalesceType(args[0].ResultType(), args[1].ResultType())
 		if err != nil {
 			return nil, err
 		}
-		right, err := v.buildExpression(fn.Args[1], context)
-		if err != nil {
-			return nil, err
-		}
-		resultType, err := coalesceType(left.ResultType(), right.ResultType())
-		if err != nil {
-			return nil, err
-		}
-		return expr.NewCoalesce(left, right, resultType), nil
+		return expr.NewCoalesce(args[0], args[1], resultType), nil
 	default:
-		return nil, fmt.Errorf("validator: unknown function %s", fn.Name)
+		return nil, fmt.Errorf("validator: unknown function %s", name)
 	}
 }
 
@@ -769,6 +1234,60 @@ func mapBooleanOp(op parser.BinaryOp) expr.BinaryOp {
 		return expr.BinaryOpAnd
 	}
 	return expr.BinaryOpOr
+}
+
+func deriveSumType(argType expr.Type) (expr.Type, error) {
+	switch argType.Kind {
+	case expr.TypeNull:
+		return expr.DecimalType(true, 38, 0), nil
+	case expr.TypeInt, expr.TypeBigInt:
+		return expr.DecimalType(true, 38, 0), nil
+	case expr.TypeDecimal:
+		precision := argType.Precision
+		if precision == 0 {
+			precision = 18
+		}
+		return expr.DecimalType(true, precision+10, argType.Scale), nil
+	default:
+		return expr.Type{}, fmt.Errorf("validator: invalid aggregate argument type for SUM: %s", describeType(argType))
+	}
+}
+
+func deriveAvgType(argType expr.Type) (expr.Type, error) {
+	switch argType.Kind {
+	case expr.TypeNull:
+		return expr.DecimalType(true, 38, 6), nil
+	case expr.TypeInt, expr.TypeBigInt:
+		return expr.DecimalType(true, 38, 6), nil
+	case expr.TypeDecimal:
+		precision := argType.Precision
+		if precision == 0 {
+			precision = 18
+		}
+		return expr.DecimalType(true, precision+10, argType.Scale), nil
+	default:
+		return expr.Type{}, fmt.Errorf("validator: invalid aggregate argument type for AVG: %s", describeType(argType))
+	}
+}
+
+func deriveMinMaxType(argType expr.Type, name string) (expr.Type, error) {
+	switch argType.Kind {
+	case expr.TypeNull:
+		return expr.NullType(), nil
+	case expr.TypeInt, expr.TypeBigInt, expr.TypeDecimal, expr.TypeVarChar, expr.TypeBoolean, expr.TypeDate, expr.TypeTimestamp:
+		return argType.WithNullability(true), nil
+	default:
+		return expr.Type{}, fmt.Errorf("validator: invalid aggregate argument type for %s: %s", name, describeType(argType))
+	}
+}
+
+func isAggregateFunction(name string) bool {
+	switch name {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		return true
+	default:
+		return false
+	}
 }
 
 func decimalMetadata(raw string) (int, int) {

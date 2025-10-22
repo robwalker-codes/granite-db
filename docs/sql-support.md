@@ -1,9 +1,9 @@
 # SQL support
 
-GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 2
-builds upon the Stage 1 expression engine by introducing two-table joins with
-alias-aware name resolution while retaining the existing filtering, ordering,
-and limiting features.
+GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 3
+builds upon the Stage 2 join work by introducing grouping, aggregation, and
+multi-key ordering while retaining the existing expression grammar and join
+pipeline.
 
 ## Projection expressions
 
@@ -49,9 +49,31 @@ the filter is applied after the join: predicates referencing the right-hand
 table may therefore collapse the LEFT JOIN back into an INNER join when they
 reject `NULL` rows.
 
-`ORDER BY` supports single column keys with optional `ASC`/`DESC` modifiers. The
-column reference may be qualified (`alias.column`) to disambiguate joins. `LIMIT
-... OFFSET ...` retains its existing semantics.
+`ORDER BY` supports multi-column keys with optional `ASC`/`DESC` modifiers per
+expression. Expressions may reference projection aliases or be re-evaluated in
+place, and `NULL` values are always placed last. `LIMIT ... OFFSET ...` retains
+its existing semantics.
+
+## Grouping and aggregation
+
+`GROUP BY` clauses collect rows into groups using any deterministic expression
+over the input columns. Each projection must either be an aggregate function or
+be composed entirely from grouped expressions. The following aggregate
+functions are available:
+
+* `COUNT(*)`
+* `COUNT(expr)` (ignores `NULL` values)
+* `SUM(expr)`
+* `AVG(expr)`
+* `MIN(expr)`
+* `MAX(expr)`
+
+Aggregates infer result types based on their arguments. Integer inputs widen to
+`DECIMAL` to avoid overflow, whilst `DECIMAL(p,s)` inputs widen to
+`DECIMAL(p+10, s)`. Aggregate results honour SQL `NULL` semantics: `COUNT` never
+returns `NULL`, whereas `SUM`/`AVG` return `NULL` for all-null groups. `HAVING`
+filters are evaluated after aggregation and may reference group keys or
+aggregate outputs.
 
 ## FROM clause and joins
 
@@ -83,7 +105,7 @@ evaluated left-to-right without reordering.
 * Mixing `*` with other projection expressions is not yet supported.
 * Joins are limited to left-deep chains of INNER and LEFT joins. No USING,
   RIGHT/FULL joins, or join reordering are available.
-* No user-defined functions or additional scalar built-ins beyond the list
-  above.
-* ORDER BY expressions are limited to base columns.
+* Aggregate functions do not support `DISTINCT`, window functions, or grouping
+  sets.
+* No user-defined scalar functions beyond the listed built-ins.
 

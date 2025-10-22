@@ -195,6 +195,8 @@ func describeType(col catalog.Column) string {
 		return "BIGINT"
 	case catalog.ColumnTypeVarChar:
 		return fmt.Sprintf("VARCHAR(%d)", col.Length)
+	case catalog.ColumnTypeDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", col.Precision, col.Scale)
 	case catalog.ColumnTypeBoolean:
 		return "BOOLEAN"
 	case catalog.ColumnTypeDate:

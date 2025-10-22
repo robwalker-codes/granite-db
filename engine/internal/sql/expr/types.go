@@ -66,6 +66,8 @@ func FromColumn(col catalog.Column) Type {
 		return Type{Kind: TypeInt, Nullable: !col.NotNull}
 	case catalog.ColumnTypeBigInt:
 		return Type{Kind: TypeBigInt, Nullable: !col.NotNull}
+	case catalog.ColumnTypeDecimal:
+		return Type{Kind: TypeDecimal, Nullable: !col.NotNull, Precision: col.Precision, Scale: col.Scale}
 	case catalog.ColumnTypeVarChar:
 		return Type{Kind: TypeVarChar, Nullable: !col.NotNull, Length: col.Length}
 	case catalog.ColumnTypeBoolean:
@@ -139,6 +141,38 @@ func NewColumnRef(idx int, col catalog.Column) *ColumnRef {
 // ResultType implements TypedExpr.
 func (c *ColumnRef) ResultType() Type {
 	return c.typ
+}
+
+// GroupRef references a GROUP BY key produced during aggregation.
+type GroupRef struct {
+	Index int
+	typ   Type
+}
+
+// NewGroupRef constructs a reference to a grouping column.
+func NewGroupRef(idx int, typ Type) *GroupRef {
+	return &GroupRef{Index: idx, typ: typ}
+}
+
+// ResultType implements TypedExpr.
+func (g *GroupRef) ResultType() Type {
+	return g.typ
+}
+
+// AggregateRef references the result of an aggregate function.
+type AggregateRef struct {
+	Index int
+	typ   Type
+}
+
+// NewAggregateRef constructs an aggregate reference.
+func NewAggregateRef(idx int, typ Type) *AggregateRef {
+	return &AggregateRef{Index: idx, typ: typ}
+}
+
+// ResultType implements TypedExpr.
+func (a *AggregateRef) ResultType() Type {
+	return a.typ
 }
 
 // Literal represents a constant expression.

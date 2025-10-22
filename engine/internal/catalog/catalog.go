@@ -20,6 +20,7 @@ const (
 	ColumnTypeBoolean
 	ColumnTypeDate
 	ColumnTypeTimestamp
+	ColumnTypeDecimal
 )
 
 // Column describes a table column.
@@ -27,8 +28,69 @@ type Column struct {
 	Name       string
 	Type       ColumnType
 	Length     int
+	Precision  int
+	Scale      int
 	NotNull    bool
 	PrimaryKey bool
+}
+
+const maxColumnLength = 0xFFFF
+
+func encodeColumnMetadata(col Column) (uint16, error) {
+	switch col.Type {
+	case ColumnTypeVarChar:
+		if col.Length <= 0 {
+			return 0, fmt.Errorf("catalog: VARCHAR length must be positive")
+		}
+		if col.Length > maxColumnLength {
+			return 0, fmt.Errorf("catalog: VARCHAR length exceeds limit")
+		}
+		return uint16(col.Length), nil
+	case ColumnTypeDecimal:
+		if col.Precision <= 0 {
+			return 0, fmt.Errorf("catalog: DECIMAL precision must be positive")
+		}
+		if col.Scale < 0 {
+			return 0, fmt.Errorf("catalog: DECIMAL scale must be non-negative")
+		}
+		if col.Scale > col.Precision {
+			return 0, fmt.Errorf("catalog: DECIMAL scale cannot exceed precision")
+		}
+		if col.Precision > 255 {
+			return 0, fmt.Errorf("catalog: DECIMAL precision exceeds supported limit")
+		}
+		if col.Scale > 255 {
+			return 0, fmt.Errorf("catalog: DECIMAL scale exceeds supported limit")
+		}
+		return uint16((col.Precision << 8) | col.Scale), nil
+	default:
+		if col.Length < 0 {
+			return 0, fmt.Errorf("catalog: negative length for column %s", col.Name)
+		}
+		if col.Length > maxColumnLength {
+			return 0, fmt.Errorf("catalog: metadata for column %s exceeds limit", col.Name)
+		}
+		return uint16(col.Length), nil
+	}
+}
+
+func decodeColumnMetadata(colType ColumnType, raw uint16) (length int, precision int, scale int, err error) {
+	switch colType {
+	case ColumnTypeVarChar:
+		return int(raw), 0, 0, nil
+	case ColumnTypeDecimal:
+		precision = int(raw >> 8)
+		scale = int(raw & 0xFF)
+		if precision == 0 && scale == 0 {
+			return 0, 0, 0, fmt.Errorf("catalog: invalid DECIMAL metadata")
+		}
+		if scale > precision {
+			return 0, 0, 0, fmt.Errorf("catalog: DECIMAL scale exceeds precision")
+		}
+		return 0, precision, scale, nil
+	default:
+		return int(raw), 0, 0, nil
+	}
 }
 
 // Table captures metadata for a user table.
@@ -103,12 +165,19 @@ func Load(mgr *storage.Manager) (*Catalog, error) {
 			if err := binary.Read(reader, binary.LittleEndian, &notNull); err != nil {
 				return nil, err
 			}
-			cols[c] = Column{
+			col := Column{
 				Name:    colName,
 				Type:    ColumnType(typeCode),
-				Length:  int(length),
 				NotNull: notNull == 1,
 			}
+			decodedLength, precision, scale, err := decodeColumnMetadata(col.Type, length)
+			if err != nil {
+				return nil, err
+			}
+			col.Length = decodedLength
+			col.Precision = precision
+			col.Scale = scale
+			cols[c] = col
 		}
 		if primaryIndex >= 0 && int(primaryIndex) < len(cols) {
 			cols[primaryIndex].PrimaryKey = true
@@ -189,7 +258,11 @@ func (c *Catalog) persist() error {
 			if err := binary.Write(buf, binary.LittleEndian, uint8(col.Type)); err != nil {
 				return err
 			}
-			if err := binary.Write(buf, binary.LittleEndian, uint16(col.Length)); err != nil {
+			meta, err := encodeColumnMetadata(col)
+			if err != nil {
+				return err
+			}
+			if err := binary.Write(buf, binary.LittleEndian, meta); err != nil {
 				return err
 			}
 			var notNull uint8
@@ -216,8 +289,8 @@ func (c *Catalog) CreateTable(name string, columns []Column, primaryKey string) 
 	cols := make([]Column, len(columns))
 	copy(cols, columns)
 	for i := range cols {
-		if cols[i].Type == ColumnTypeVarChar && cols[i].Length <= 0 {
-			return nil, fmt.Errorf("catalog: VARCHAR length must be positive")
+		if _, err := encodeColumnMetadata(cols[i]); err != nil {
+			return nil, err
 		}
 	}
 	if primaryKey != "" {

@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/example/granite-db/engine/internal/catalog"
 )
 
@@ -14,11 +16,16 @@ func TestRowCodecRoundTrip(t *testing.T) {
 		{Name: "active", Type: catalog.ColumnTypeBoolean},
 		{Name: "joined", Type: catalog.ColumnTypeDate},
 		{Name: "updated", Type: catalog.ColumnTypeTimestamp},
+		{Name: "balance", Type: catalog.ColumnTypeDecimal, Precision: 12, Scale: 2},
 		{Name: "nick", Type: catalog.ColumnTypeVarChar, Length: 10},
 	}
 	joined := time.Date(2023, 5, 1, 0, 0, 0, 0, time.UTC)
 	updated := time.Date(2023, 5, 1, 12, 30, 0, 0, time.UTC)
-	values := []interface{}{int32(7), "Ada", true, joined, updated, nil}
+	balance, err := decimal.NewFromString("1234.50")
+	if err != nil {
+		t.Fatalf("decimal parse: %v", err)
+	}
+	values := []interface{}{int32(7), "Ada", true, joined, updated, balance, nil}
 
 	encoded, err := EncodeRow(columns, values)
 	if err != nil {
@@ -46,7 +53,10 @@ func TestRowCodecRoundTrip(t *testing.T) {
 	if !decoded[4].(time.Time).Equal(updated.UTC()) {
 		t.Fatalf("timestamp mismatch: got %v want %v", decoded[4], updated)
 	}
-	if decoded[5] != nil {
-		t.Fatalf("expected nil nickname, got %v", decoded[5])
+	if !decoded[5].(decimal.Decimal).Equal(balance) {
+		t.Fatalf("decimal mismatch: got %v want %v", decoded[5], balance)
+	}
+	if decoded[6] != nil {
+		t.Fatalf("expected nil nickname, got %v", decoded[6])
 	}
 }

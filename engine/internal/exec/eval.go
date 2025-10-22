@@ -50,6 +50,18 @@ func (e *valueEvaluator) eval(node expr.TypedExpr) (typedValue, error) {
 			return typedValue{typ: n.ResultType(), null: true}, nil
 		}
 		return typedValue{typ: n.ResultType(), data: value}, nil
+	case *expr.GroupRef:
+		value := e.row[n.Index]
+		if value == nil {
+			return typedValue{typ: n.ResultType(), null: true}, nil
+		}
+		return typedValue{typ: n.ResultType(), data: value}, nil
+	case *expr.AggregateRef:
+		value := e.row[n.Index]
+		if value == nil {
+			return typedValue{typ: n.ResultType(), null: true}, nil
+		}
+		return typedValue{typ: n.ResultType(), data: value}, nil
 	case *expr.Literal:
 		if n.Value == nil {
 			return typedValue{typ: n.ResultType(), null: true}, nil
@@ -75,7 +87,7 @@ func (e *valueEvaluator) eval(node expr.TypedExpr) (typedValue, error) {
 		if err != nil {
 			return typedValue{}, err
 		}
-		result := !inner.isNull()
+		result := inner.isNull()
 		if n.Negated {
 			result = !result
 		}
