@@ -2,9 +2,10 @@
 
 GraniteDB follows a clean architecture split between the storage engine, the SQL
 front-end, and the command-line tooling. Each layer exposes narrow interfaces so
-that the system stays modular as new features arrive. Stage 5 layers foreign key
-metadata and enforcement onto the Stage 4 storage and planning improvements
-while retaining the reusable B⁺-trees and index-aware heuristics.
+that the system stays modular as new features arrive. Stage 6 builds upon the
+foreign key work by adding explicit transactions, a lock manager, and session
+aware execution whilst retaining the reusable B⁺-trees and index-aware
+heuristics.
 
 ## Storage engine
 
@@ -132,3 +133,35 @@ actions. During DML the executor uses this metadata to gate modifications:
 
 All checks are immediate and wrapped around the existing heap/index writes, so
 foreign key errors are surfaced before any WAL entries are emitted.
+
+## Transaction management
+
+Transactions are coordinated by a dedicated manager in `internal/txn`. Each
+session obtains a transaction identifier when it issues `BEGIN` (or one of its
+synonyms). Autocommit statements still exist: when no transaction is active the
+API requests a temporary transaction, marks it as autocommit, and commits or
+rolls back automatically after the statement finishes. Explicit transactions
+remain tied to the session until `COMMIT` or `ROLLBACK` releases the identifier.
+
+Every transaction records its held locks so that the manager can release them on
+completion. Rollbacks reapply captured undo actions to restore heap rows and
+index entries to their pre-statement state.
+
+Lock coordination happens inside the new lock manager. It tracks table-level
+shared/exclusive locks and row-level exclusive locks. Requests block until they
+are compatible with existing holders or until a timeout expires. The following
+matrix summarises compatibility:
+
+```
+Lock compatibility (request vs held)
+
+            | Held S | Held X
+------------+--------+--------
+Request S   |   ✓    |   ✗
+Request X   |   ✗    |   ✗
+```
+
+Shared locks allow concurrent readers, whereas exclusive locks wait for all
+other holders to finish. Conflicts beyond the two second timeout surface as
+errors such as `lock timeout on row orders[1:1]` so that callers can retry or
+abort their work.

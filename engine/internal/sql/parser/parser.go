@@ -39,22 +39,71 @@ func (p *Parser) nextToken() {
 }
 
 func (p *Parser) parseStatement() (Statement, error) {
-        switch strings.ToUpper(p.curToken.Literal) {
-        case "CREATE":
-                return p.parseCreate()
-        case "DROP":
-                return p.parseDrop()
-        case "INSERT":
-                return p.parseInsert()
-        case "SELECT":
-                return p.parseSelect()
-        case "UPDATE":
-                return p.parseUpdate()
-        case "DELETE":
-                return p.parseDelete()
-        default:
-                return nil, fmt.Errorf("parser: unexpected token %s", p.curToken.Literal)
-        }
+	switch strings.ToUpper(p.curToken.Literal) {
+	case "BEGIN":
+		return p.parseBegin()
+	case "START":
+		return p.parseStart()
+	case "COMMIT":
+		return p.parseCommit()
+	case "ROLLBACK":
+		return p.parseRollback()
+	case "CREATE":
+		return p.parseCreate()
+	case "DROP":
+		return p.parseDrop()
+	case "INSERT":
+		return p.parseInsert()
+	case "SELECT":
+		return p.parseSelect()
+	case "UPDATE":
+		return p.parseUpdate()
+	case "DELETE":
+		return p.parseDelete()
+	default:
+		return nil, fmt.Errorf("parser: unexpected token %s", p.curToken.Literal)
+	}
+}
+
+func (p *Parser) parseBegin() (Statement, error) {
+	if err := p.consumeKeyword("BEGIN"); err != nil {
+		return nil, err
+	}
+	if strings.ToUpper(p.curToken.Literal) == "TRANSACTION" {
+		p.nextToken()
+	}
+	return &BeginStmt{}, nil
+}
+
+func (p *Parser) parseStart() (Statement, error) {
+	if err := p.consumeKeyword("START"); err != nil {
+		return nil, err
+	}
+	if strings.ToUpper(p.curToken.Literal) != "TRANSACTION" {
+		return nil, fmt.Errorf("parser: expected TRANSACTION after START")
+	}
+	p.nextToken()
+	return &BeginStmt{}, nil
+}
+
+func (p *Parser) parseCommit() (Statement, error) {
+	if err := p.consumeKeyword("COMMIT"); err != nil {
+		return nil, err
+	}
+	if strings.ToUpper(p.curToken.Literal) == "TRANSACTION" {
+		p.nextToken()
+	}
+	return &CommitStmt{}, nil
+}
+
+func (p *Parser) parseRollback() (Statement, error) {
+	if err := p.consumeKeyword("ROLLBACK"); err != nil {
+		return nil, err
+	}
+	if strings.ToUpper(p.curToken.Literal) == "TRANSACTION" {
+		p.nextToken()
+	}
+	return &RollbackStmt{}, nil
 }
 
 func (p *Parser) expectKeyword(keyword string) error {
@@ -73,354 +122,354 @@ func (p *Parser) consumeKeyword(keyword string) error {
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
-        if err := p.consumeKeyword("CREATE"); err != nil {
-                return nil, err
-        }
-        unique := false
-        if strings.ToUpper(p.curToken.Literal) == "UNIQUE" {
-                unique = true
-                p.nextToken()
-        }
-        switch strings.ToUpper(p.curToken.Literal) {
-        case "TABLE":
-                if unique {
-                        return nil, fmt.Errorf("parser: UNIQUE not valid before CREATE TABLE")
-                }
-                return p.parseCreateTable()
-        case "INDEX":
-                return p.parseCreateIndex(unique)
-        default:
-                if unique {
-                        return nil, fmt.Errorf("parser: expected INDEX after UNIQUE in CREATE")
-                }
-                return nil, fmt.Errorf("parser: expected TABLE or INDEX after CREATE, found %s", p.curToken.Literal)
-        }
+	if err := p.consumeKeyword("CREATE"); err != nil {
+		return nil, err
+	}
+	unique := false
+	if strings.ToUpper(p.curToken.Literal) == "UNIQUE" {
+		unique = true
+		p.nextToken()
+	}
+	switch strings.ToUpper(p.curToken.Literal) {
+	case "TABLE":
+		if unique {
+			return nil, fmt.Errorf("parser: UNIQUE not valid before CREATE TABLE")
+		}
+		return p.parseCreateTable()
+	case "INDEX":
+		return p.parseCreateIndex(unique)
+	default:
+		if unique {
+			return nil, fmt.Errorf("parser: expected INDEX after UNIQUE in CREATE")
+		}
+		return nil, fmt.Errorf("parser: expected TABLE or INDEX after CREATE, found %s", p.curToken.Literal)
+	}
 }
 
 func (p *Parser) parseCreateTable() (Statement, error) {
-        if err := p.consumeKeyword("TABLE"); err != nil {
-                return nil, err
-        }
-        name := p.curToken.Literal
-        if p.curToken.Type != lexer.Ident {
-                return nil, fmt.Errorf("parser: expected table name but found %s", p.curToken.Literal)
-        }
-        p.nextToken()
-        if p.curToken.Type != lexer.LParen {
-                return nil, fmt.Errorf("parser: expected ( after table name")
-        }
-        p.nextToken()
+	if err := p.consumeKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+	name := p.curToken.Literal
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected table name but found %s", p.curToken.Literal)
+	}
+	p.nextToken()
+	if p.curToken.Type != lexer.LParen {
+		return nil, fmt.Errorf("parser: expected ( after table name")
+	}
+	p.nextToken()
 
-        cols := []ColumnDef{}
-        foreignKeys := []ForeignKeyDef{}
-        var primaryKey string
-        for {
-                upper := strings.ToUpper(p.curToken.Literal)
-                switch upper {
-                case "PRIMARY":
-                        if primaryKey != "" {
-                                return nil, fmt.Errorf("parser: primary key already defined")
-                        }
-                        pk, err := p.parsePrimaryKeyClause()
-                        if err != nil {
-                                return nil, err
-                        }
-                        primaryKey = pk
-                case "CONSTRAINT":
-                        p.nextToken()
-                        if p.curToken.Type != lexer.Ident {
-                                return nil, fmt.Errorf("parser: expected constraint name")
-                        }
-                        constraintName := p.curToken.Literal
-                        p.nextToken()
-                        next := strings.ToUpper(p.curToken.Literal)
-                        switch next {
-                        case "PRIMARY":
-                                if primaryKey != "" {
-                                        return nil, fmt.Errorf("parser: primary key already defined")
-                                }
-                                pk, err := p.parsePrimaryKeyClause()
-                                if err != nil {
-                                        return nil, err
-                                }
-                                primaryKey = pk
-                        case "FOREIGN":
-                                fk, err := p.parseTableForeignKey(constraintName)
-                                if err != nil {
-                                        return nil, err
-                                }
-                                foreignKeys = append(foreignKeys, fk)
-                        default:
-                                return nil, fmt.Errorf("parser: unsupported constraint type %s", p.curToken.Literal)
-                        }
-                case "FOREIGN":
-                        fk, err := p.parseTableForeignKey("")
-                        if err != nil {
-                                return nil, err
-                        }
-                        foreignKeys = append(foreignKeys, fk)
-                default:
-                        col, inline, err := p.parseColumnDef()
-                        if err != nil {
-                                return nil, err
-                        }
-                        if col.PrimaryKey {
-                                if primaryKey != "" {
-                                        return nil, fmt.Errorf("parser: primary key already defined")
-                                }
-                                primaryKey = col.Name
-                        }
-                        cols = append(cols, col)
-                        if len(inline) > 0 {
-                                foreignKeys = append(foreignKeys, inline...)
-                        }
-                }
+	cols := []ColumnDef{}
+	foreignKeys := []ForeignKeyDef{}
+	var primaryKey string
+	for {
+		upper := strings.ToUpper(p.curToken.Literal)
+		switch upper {
+		case "PRIMARY":
+			if primaryKey != "" {
+				return nil, fmt.Errorf("parser: primary key already defined")
+			}
+			pk, err := p.parsePrimaryKeyClause()
+			if err != nil {
+				return nil, err
+			}
+			primaryKey = pk
+		case "CONSTRAINT":
+			p.nextToken()
+			if p.curToken.Type != lexer.Ident {
+				return nil, fmt.Errorf("parser: expected constraint name")
+			}
+			constraintName := p.curToken.Literal
+			p.nextToken()
+			next := strings.ToUpper(p.curToken.Literal)
+			switch next {
+			case "PRIMARY":
+				if primaryKey != "" {
+					return nil, fmt.Errorf("parser: primary key already defined")
+				}
+				pk, err := p.parsePrimaryKeyClause()
+				if err != nil {
+					return nil, err
+				}
+				primaryKey = pk
+			case "FOREIGN":
+				fk, err := p.parseTableForeignKey(constraintName)
+				if err != nil {
+					return nil, err
+				}
+				foreignKeys = append(foreignKeys, fk)
+			default:
+				return nil, fmt.Errorf("parser: unsupported constraint type %s", p.curToken.Literal)
+			}
+		case "FOREIGN":
+			fk, err := p.parseTableForeignKey("")
+			if err != nil {
+				return nil, err
+			}
+			foreignKeys = append(foreignKeys, fk)
+		default:
+			col, inline, err := p.parseColumnDef()
+			if err != nil {
+				return nil, err
+			}
+			if col.PrimaryKey {
+				if primaryKey != "" {
+					return nil, fmt.Errorf("parser: primary key already defined")
+				}
+				primaryKey = col.Name
+			}
+			cols = append(cols, col)
+			if len(inline) > 0 {
+				foreignKeys = append(foreignKeys, inline...)
+			}
+		}
 
-                if p.curToken.Type == lexer.Comma {
-                        p.nextToken()
-                        continue
-                }
-                break
-        }
+		if p.curToken.Type == lexer.Comma {
+			p.nextToken()
+			continue
+		}
+		break
+	}
 
-        if p.curToken.Type != lexer.RParen {
-                return nil, fmt.Errorf("parser: expected ) to close column list")
-        }
-        p.nextToken()
+	if p.curToken.Type != lexer.RParen {
+		return nil, fmt.Errorf("parser: expected ) to close column list")
+	}
+	p.nextToken()
 
-        return &CreateTableStmt{Name: name, Columns: cols, PrimaryKey: primaryKey, ForeignKeys: foreignKeys}, nil
+	return &CreateTableStmt{Name: name, Columns: cols, PrimaryKey: primaryKey, ForeignKeys: foreignKeys}, nil
 }
 
 func (p *Parser) parseCreateIndex(unique bool) (Statement, error) {
-        if err := p.consumeKeyword("INDEX"); err != nil {
-                return nil, err
-        }
-        if p.curToken.Type != lexer.Ident {
-                return nil, fmt.Errorf("parser: expected index name after CREATE INDEX")
-        }
-        name := p.curToken.Literal
-        p.nextToken()
-        if err := p.consumeKeyword("ON"); err != nil {
-                return nil, err
-        }
-        if p.curToken.Type != lexer.Ident {
-                return nil, fmt.Errorf("parser: expected table name after CREATE INDEX")
-        }
-        table := p.curToken.Literal
-        p.nextToken()
-        if p.curToken.Type != lexer.LParen {
-                return nil, fmt.Errorf("parser: expected column list for CREATE INDEX")
-        }
-        p.nextToken()
-        columns, err := p.parseIdentifierList()
-        if err != nil {
-                return nil, err
-        }
-        if len(columns) == 0 {
-                return nil, fmt.Errorf("parser: CREATE INDEX requires at least one column")
-        }
-        return &CreateIndexStmt{Name: name, Table: table, Columns: columns, Unique: unique}, nil
+	if err := p.consumeKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected index name after CREATE INDEX")
+	}
+	name := p.curToken.Literal
+	p.nextToken()
+	if err := p.consumeKeyword("ON"); err != nil {
+		return nil, err
+	}
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected table name after CREATE INDEX")
+	}
+	table := p.curToken.Literal
+	p.nextToken()
+	if p.curToken.Type != lexer.LParen {
+		return nil, fmt.Errorf("parser: expected column list for CREATE INDEX")
+	}
+	p.nextToken()
+	columns, err := p.parseIdentifierList()
+	if err != nil {
+		return nil, err
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("parser: CREATE INDEX requires at least one column")
+	}
+	return &CreateIndexStmt{Name: name, Table: table, Columns: columns, Unique: unique}, nil
 }
 
 func (p *Parser) parseColumnDef() (ColumnDef, []ForeignKeyDef, error) {
-        name := p.curToken.Literal
-        if p.curToken.Type != lexer.Ident {
-                return ColumnDef{}, nil, fmt.Errorf("parser: expected column name but found %s", p.curToken.Literal)
-        }
-        p.nextToken()
+	name := p.curToken.Literal
+	if p.curToken.Type != lexer.Ident {
+		return ColumnDef{}, nil, fmt.Errorf("parser: expected column name but found %s", p.curToken.Literal)
+	}
+	p.nextToken()
 
-        colType, length, precision, scale, err := p.parseType()
-        if err != nil {
-                return ColumnDef{}, nil, err
-        }
-        notNull := false
-        primaryKey := false
-        pendingConstraint := ""
-        inlineFKs := []ForeignKeyDef{}
-        for {
-                switch strings.ToUpper(p.curToken.Literal) {
-                case "CONSTRAINT":
-                        if pendingConstraint != "" {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: multiple constraint names on column %s", name)
-                        }
-                        p.nextToken()
-                        if p.curToken.Type != lexer.Ident {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: expected constraint name for column %s", name)
-                        }
-                        pendingConstraint = p.curToken.Literal
-                        p.nextToken()
-                case "NOT":
-                        if notNull {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: NOT NULL specified multiple times")
-                        }
-                        p.nextToken()
-                        if strings.ToUpper(p.curToken.Literal) != "NULL" {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: expected NULL after NOT")
-                        }
-                        p.nextToken()
-                        notNull = true
-                case "PRIMARY":
-                        if primaryKey {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: PRIMARY KEY specified multiple times")
-                        }
-                        p.nextToken()
-                        if strings.ToUpper(p.curToken.Literal) != "KEY" {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: expected KEY after PRIMARY")
-                        }
-                        p.nextToken()
-                        primaryKey = true
-                        notNull = true
-                        pendingConstraint = ""
-                case "REFERENCES":
-                        fk, err := p.parseInlineForeignKey(name, pendingConstraint)
-                        if err != nil {
-                                return ColumnDef{}, nil, err
-                        }
-                        inlineFKs = append(inlineFKs, fk)
-                        pendingConstraint = ""
-                default:
-                        if pendingConstraint != "" {
-                                return ColumnDef{}, nil, fmt.Errorf("parser: constraint name %s must be followed by a constraint definition", pendingConstraint)
-                        }
-                        return ColumnDef{Name: name, Type: colType, Length: length, Precision: precision, Scale: scale, NotNull: notNull, PrimaryKey: primaryKey}, inlineFKs, nil
-                }
-        }
+	colType, length, precision, scale, err := p.parseType()
+	if err != nil {
+		return ColumnDef{}, nil, err
+	}
+	notNull := false
+	primaryKey := false
+	pendingConstraint := ""
+	inlineFKs := []ForeignKeyDef{}
+	for {
+		switch strings.ToUpper(p.curToken.Literal) {
+		case "CONSTRAINT":
+			if pendingConstraint != "" {
+				return ColumnDef{}, nil, fmt.Errorf("parser: multiple constraint names on column %s", name)
+			}
+			p.nextToken()
+			if p.curToken.Type != lexer.Ident {
+				return ColumnDef{}, nil, fmt.Errorf("parser: expected constraint name for column %s", name)
+			}
+			pendingConstraint = p.curToken.Literal
+			p.nextToken()
+		case "NOT":
+			if notNull {
+				return ColumnDef{}, nil, fmt.Errorf("parser: NOT NULL specified multiple times")
+			}
+			p.nextToken()
+			if strings.ToUpper(p.curToken.Literal) != "NULL" {
+				return ColumnDef{}, nil, fmt.Errorf("parser: expected NULL after NOT")
+			}
+			p.nextToken()
+			notNull = true
+		case "PRIMARY":
+			if primaryKey {
+				return ColumnDef{}, nil, fmt.Errorf("parser: PRIMARY KEY specified multiple times")
+			}
+			p.nextToken()
+			if strings.ToUpper(p.curToken.Literal) != "KEY" {
+				return ColumnDef{}, nil, fmt.Errorf("parser: expected KEY after PRIMARY")
+			}
+			p.nextToken()
+			primaryKey = true
+			notNull = true
+			pendingConstraint = ""
+		case "REFERENCES":
+			fk, err := p.parseInlineForeignKey(name, pendingConstraint)
+			if err != nil {
+				return ColumnDef{}, nil, err
+			}
+			inlineFKs = append(inlineFKs, fk)
+			pendingConstraint = ""
+		default:
+			if pendingConstraint != "" {
+				return ColumnDef{}, nil, fmt.Errorf("parser: constraint name %s must be followed by a constraint definition", pendingConstraint)
+			}
+			return ColumnDef{Name: name, Type: colType, Length: length, Precision: precision, Scale: scale, NotNull: notNull, PrimaryKey: primaryKey}, inlineFKs, nil
+		}
+	}
 }
 
 func (p *Parser) parsePrimaryKeyClause() (string, error) {
-        if err := p.consumeKeyword("PRIMARY"); err != nil {
-                return "", err
-        }
-        if err := p.consumeKeyword("KEY"); err != nil {
-                return "", err
-        }
-        if p.curToken.Type != lexer.LParen {
-                return "", fmt.Errorf("parser: expected ( after PRIMARY KEY")
-        }
-        p.nextToken()
-        if p.curToken.Type != lexer.Ident {
-                return "", fmt.Errorf("parser: expected column name in PRIMARY KEY")
-        }
-        column := p.curToken.Literal
-        p.nextToken()
-        if p.curToken.Type != lexer.RParen {
-                return "", fmt.Errorf("parser: expected ) after PRIMARY KEY column")
-        }
-        p.nextToken()
-        return column, nil
+	if err := p.consumeKeyword("PRIMARY"); err != nil {
+		return "", err
+	}
+	if err := p.consumeKeyword("KEY"); err != nil {
+		return "", err
+	}
+	if p.curToken.Type != lexer.LParen {
+		return "", fmt.Errorf("parser: expected ( after PRIMARY KEY")
+	}
+	p.nextToken()
+	if p.curToken.Type != lexer.Ident {
+		return "", fmt.Errorf("parser: expected column name in PRIMARY KEY")
+	}
+	column := p.curToken.Literal
+	p.nextToken()
+	if p.curToken.Type != lexer.RParen {
+		return "", fmt.Errorf("parser: expected ) after PRIMARY KEY column")
+	}
+	p.nextToken()
+	return column, nil
 }
 
 func (p *Parser) parseTableForeignKey(name string) (ForeignKeyDef, error) {
-        if err := p.consumeKeyword("FOREIGN"); err != nil {
-                return ForeignKeyDef{}, err
-        }
-        if err := p.consumeKeyword("KEY"); err != nil {
-                return ForeignKeyDef{}, err
-        }
-        if p.curToken.Type != lexer.LParen {
-                return ForeignKeyDef{}, fmt.Errorf("parser: expected ( after FOREIGN KEY")
-        }
-        p.nextToken()
-        childCols, err := p.parseIdentifierList()
-        if err != nil {
-                return ForeignKeyDef{}, err
-        }
-        if len(childCols) == 0 {
-                return ForeignKeyDef{}, fmt.Errorf("parser: FOREIGN KEY requires at least one column")
-        }
-        return p.parseForeignKeyReference(name, childCols)
+	if err := p.consumeKeyword("FOREIGN"); err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if err := p.consumeKeyword("KEY"); err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if p.curToken.Type != lexer.LParen {
+		return ForeignKeyDef{}, fmt.Errorf("parser: expected ( after FOREIGN KEY")
+	}
+	p.nextToken()
+	childCols, err := p.parseIdentifierList()
+	if err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if len(childCols) == 0 {
+		return ForeignKeyDef{}, fmt.Errorf("parser: FOREIGN KEY requires at least one column")
+	}
+	return p.parseForeignKeyReference(name, childCols)
 }
 
 func (p *Parser) parseInlineForeignKey(columnName, constraintName string) (ForeignKeyDef, error) {
-        return p.parseForeignKeyReference(constraintName, []string{columnName})
+	return p.parseForeignKeyReference(constraintName, []string{columnName})
 }
 
 func (p *Parser) parseForeignKeyReference(name string, childCols []string) (ForeignKeyDef, error) {
-        if err := p.consumeKeyword("REFERENCES"); err != nil {
-                return ForeignKeyDef{}, err
-        }
-        if p.curToken.Type != lexer.Ident {
-                return ForeignKeyDef{}, fmt.Errorf("parser: expected referenced table name")
-        }
-        parentTable := p.curToken.Literal
-        p.nextToken()
-        if p.curToken.Type != lexer.LParen {
-                return ForeignKeyDef{}, fmt.Errorf("parser: expected ( after referenced table name")
-        }
-        p.nextToken()
-        parentCols, err := p.parseIdentifierList()
-        if err != nil {
-                return ForeignKeyDef{}, err
-        }
-        if len(parentCols) == 0 {
-                return ForeignKeyDef{}, fmt.Errorf("parser: referenced column list cannot be empty")
-        }
-        fk := ForeignKeyDef{
-                Name:            name,
-                Columns:         childCols,
-                ReferencedTable: parentTable,
-                ReferencedCols:  parentCols,
-                OnDelete:        ForeignKeyActionRestrict,
-                OnUpdate:        ForeignKeyActionRestrict,
-                Deferrable:      false,
-        }
-        deleteSet := false
-        updateSet := false
-        for strings.ToUpper(p.curToken.Literal) == "ON" {
-                p.nextToken()
-                modifier := strings.ToUpper(p.curToken.Literal)
-                if modifier != "DELETE" && modifier != "UPDATE" {
-                        return ForeignKeyDef{}, fmt.Errorf("parser: expected DELETE or UPDATE after ON")
-                }
-                p.nextToken()
-                action, err := p.parseReferentialAction()
-                if err != nil {
-                        return ForeignKeyDef{}, err
-                }
-                if modifier == "DELETE" {
-                        if deleteSet {
-                                return ForeignKeyDef{}, fmt.Errorf("parser: ON DELETE specified multiple times")
-                        }
-                        fk.OnDelete = action
-                        deleteSet = true
-                } else {
-                        if updateSet {
-                                return ForeignKeyDef{}, fmt.Errorf("parser: ON UPDATE specified multiple times")
-                        }
-                        fk.OnUpdate = action
-                        updateSet = true
-                }
-        }
-        return fk, nil
+	if err := p.consumeKeyword("REFERENCES"); err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if p.curToken.Type != lexer.Ident {
+		return ForeignKeyDef{}, fmt.Errorf("parser: expected referenced table name")
+	}
+	parentTable := p.curToken.Literal
+	p.nextToken()
+	if p.curToken.Type != lexer.LParen {
+		return ForeignKeyDef{}, fmt.Errorf("parser: expected ( after referenced table name")
+	}
+	p.nextToken()
+	parentCols, err := p.parseIdentifierList()
+	if err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if len(parentCols) == 0 {
+		return ForeignKeyDef{}, fmt.Errorf("parser: referenced column list cannot be empty")
+	}
+	fk := ForeignKeyDef{
+		Name:            name,
+		Columns:         childCols,
+		ReferencedTable: parentTable,
+		ReferencedCols:  parentCols,
+		OnDelete:        ForeignKeyActionRestrict,
+		OnUpdate:        ForeignKeyActionRestrict,
+		Deferrable:      false,
+	}
+	deleteSet := false
+	updateSet := false
+	for strings.ToUpper(p.curToken.Literal) == "ON" {
+		p.nextToken()
+		modifier := strings.ToUpper(p.curToken.Literal)
+		if modifier != "DELETE" && modifier != "UPDATE" {
+			return ForeignKeyDef{}, fmt.Errorf("parser: expected DELETE or UPDATE after ON")
+		}
+		p.nextToken()
+		action, err := p.parseReferentialAction()
+		if err != nil {
+			return ForeignKeyDef{}, err
+		}
+		if modifier == "DELETE" {
+			if deleteSet {
+				return ForeignKeyDef{}, fmt.Errorf("parser: ON DELETE specified multiple times")
+			}
+			fk.OnDelete = action
+			deleteSet = true
+		} else {
+			if updateSet {
+				return ForeignKeyDef{}, fmt.Errorf("parser: ON UPDATE specified multiple times")
+			}
+			fk.OnUpdate = action
+			updateSet = true
+		}
+	}
+	return fk, nil
 }
 
 func (p *Parser) parseReferentialAction() (ForeignKeyAction, error) {
-        upper := strings.ToUpper(p.curToken.Literal)
-        switch upper {
-        case "RESTRICT":
-                p.nextToken()
-                return ForeignKeyActionRestrict, nil
-        case "NO":
-                p.nextToken()
-                if strings.ToUpper(p.curToken.Literal) != "ACTION" {
-                        return ForeignKeyActionRestrict, fmt.Errorf("parser: expected ACTION after NO in referential action")
-                }
-                p.nextToken()
-                return ForeignKeyActionNoAction, nil
-        case "CASCADE":
-                return ForeignKeyActionRestrict, fmt.Errorf("referential action CASCADE is not supported (yet)")
-        case "SET":
-                p.nextToken()
-                action := strings.ToUpper(p.curToken.Literal)
-                switch action {
-                case "NULL", "DEFAULT":
-                        return ForeignKeyActionRestrict, fmt.Errorf("referential action SET %s is not supported (yet)", action)
-                default:
-                        return ForeignKeyActionRestrict, fmt.Errorf("parser: unsupported referential action SET %s", p.curToken.Literal)
-                }
-        default:
-                return ForeignKeyActionRestrict, fmt.Errorf("parser: unsupported referential action %s", p.curToken.Literal)
-        }
+	upper := strings.ToUpper(p.curToken.Literal)
+	switch upper {
+	case "RESTRICT":
+		p.nextToken()
+		return ForeignKeyActionRestrict, nil
+	case "NO":
+		p.nextToken()
+		if strings.ToUpper(p.curToken.Literal) != "ACTION" {
+			return ForeignKeyActionRestrict, fmt.Errorf("parser: expected ACTION after NO in referential action")
+		}
+		p.nextToken()
+		return ForeignKeyActionNoAction, nil
+	case "CASCADE":
+		return ForeignKeyActionRestrict, fmt.Errorf("referential action CASCADE is not supported (yet)")
+	case "SET":
+		p.nextToken()
+		action := strings.ToUpper(p.curToken.Literal)
+		switch action {
+		case "NULL", "DEFAULT":
+			return ForeignKeyActionRestrict, fmt.Errorf("referential action SET %s is not supported (yet)", action)
+		default:
+			return ForeignKeyActionRestrict, fmt.Errorf("parser: unsupported referential action SET %s", p.curToken.Literal)
+		}
+	default:
+		return ForeignKeyActionRestrict, fmt.Errorf("parser: unsupported referential action %s", p.curToken.Literal)
+	}
 }
 
 func (p *Parser) parseType() (DataType, int, int, int, error) {
@@ -495,36 +544,36 @@ func parseInt(value string) int {
 }
 
 func (p *Parser) parseDrop() (Statement, error) {
-        if err := p.consumeKeyword("DROP"); err != nil {
-                return nil, err
-        }
-        switch strings.ToUpper(p.curToken.Literal) {
-        case "TABLE":
-                p.nextToken()
-                if p.curToken.Type != lexer.Ident {
-                        return nil, fmt.Errorf("parser: expected table name after DROP TABLE")
-                }
-                name := p.curToken.Literal
-                p.nextToken()
-                return &DropTableStmt{Name: name}, nil
-        case "INDEX":
-                p.nextToken()
-                if p.curToken.Type != lexer.Ident {
-                        return nil, fmt.Errorf("parser: expected index name after DROP INDEX")
-                }
-                name := p.curToken.Literal
-                p.nextToken()
-                return &DropIndexStmt{Name: name}, nil
-        default:
-                return nil, fmt.Errorf("parser: expected TABLE or INDEX after DROP, found %s", p.curToken.Literal)
-        }
+	if err := p.consumeKeyword("DROP"); err != nil {
+		return nil, err
+	}
+	switch strings.ToUpper(p.curToken.Literal) {
+	case "TABLE":
+		p.nextToken()
+		if p.curToken.Type != lexer.Ident {
+			return nil, fmt.Errorf("parser: expected table name after DROP TABLE")
+		}
+		name := p.curToken.Literal
+		p.nextToken()
+		return &DropTableStmt{Name: name}, nil
+	case "INDEX":
+		p.nextToken()
+		if p.curToken.Type != lexer.Ident {
+			return nil, fmt.Errorf("parser: expected index name after DROP INDEX")
+		}
+		name := p.curToken.Literal
+		p.nextToken()
+		return &DropIndexStmt{Name: name}, nil
+	default:
+		return nil, fmt.Errorf("parser: expected TABLE or INDEX after DROP, found %s", p.curToken.Literal)
+	}
 }
 
 func (p *Parser) parseInsert() (Statement, error) {
-        if err := p.consumeKeyword("INSERT"); err != nil {
-                return nil, err
-        }
-        if err := p.consumeKeyword("INTO"); err != nil {
+	if err := p.consumeKeyword("INSERT"); err != nil {
+		return nil, err
+	}
+	if err := p.consumeKeyword("INTO"); err != nil {
 		return nil, err
 	}
 	if p.curToken.Type != lexer.Ident {
@@ -567,88 +616,88 @@ func (p *Parser) parseInsert() (Statement, error) {
 		if p.curToken.Type != lexer.LParen {
 			return nil, fmt.Errorf("parser: expected ( to start next VALUES tuple")
 		}
-        }
-        return &InsertStmt{Table: table, Columns: columns, Rows: rows}, nil
+	}
+	return &InsertStmt{Table: table, Columns: columns, Rows: rows}, nil
 }
 
 func (p *Parser) parseUpdate() (Statement, error) {
-        if err := p.consumeKeyword("UPDATE"); err != nil {
-                return nil, err
-        }
-        if p.curToken.Type != lexer.Ident {
-                return nil, fmt.Errorf("parser: expected table name after UPDATE")
-        }
-        table := p.curToken.Literal
-        p.nextToken()
-        if err := p.consumeKeyword("SET"); err != nil {
-                return nil, err
-        }
-        assignments := []UpdateAssignment{}
-        for {
-                if p.curToken.Type != lexer.Ident {
-                        return nil, fmt.Errorf("parser: expected column name in SET clause")
-                }
-                column := p.curToken.Literal
-                p.nextToken()
-                if p.curToken.Type != lexer.Equal {
-                        return nil, fmt.Errorf("parser: expected = in SET clause")
-                }
-                p.nextToken()
-                expr, err := p.parseExpression(lowestPrecedence)
-                if err != nil {
-                        return nil, err
-                }
-                assignments = append(assignments, UpdateAssignment{Column: column, Expr: expr})
-                if p.curToken.Type == lexer.Comma {
-                        p.nextToken()
-                        continue
-                }
-                break
-        }
-        if len(assignments) == 0 {
-                return nil, fmt.Errorf("parser: UPDATE requires at least one assignment")
-        }
-        var where Expression
-        if strings.ToUpper(p.curToken.Literal) == "WHERE" {
-                p.nextToken()
-                var err error
-                where, err = p.parseExpression(lowestPrecedence)
-                if err != nil {
-                        return nil, err
-                }
-        }
-        return &UpdateStmt{Table: table, Assignments: assignments, Where: where}, nil
+	if err := p.consumeKeyword("UPDATE"); err != nil {
+		return nil, err
+	}
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected table name after UPDATE")
+	}
+	table := p.curToken.Literal
+	p.nextToken()
+	if err := p.consumeKeyword("SET"); err != nil {
+		return nil, err
+	}
+	assignments := []UpdateAssignment{}
+	for {
+		if p.curToken.Type != lexer.Ident {
+			return nil, fmt.Errorf("parser: expected column name in SET clause")
+		}
+		column := p.curToken.Literal
+		p.nextToken()
+		if p.curToken.Type != lexer.Equal {
+			return nil, fmt.Errorf("parser: expected = in SET clause")
+		}
+		p.nextToken()
+		expr, err := p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		assignments = append(assignments, UpdateAssignment{Column: column, Expr: expr})
+		if p.curToken.Type == lexer.Comma {
+			p.nextToken()
+			continue
+		}
+		break
+	}
+	if len(assignments) == 0 {
+		return nil, fmt.Errorf("parser: UPDATE requires at least one assignment")
+	}
+	var where Expression
+	if strings.ToUpper(p.curToken.Literal) == "WHERE" {
+		p.nextToken()
+		var err error
+		where, err = p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &UpdateStmt{Table: table, Assignments: assignments, Where: where}, nil
 }
 
 func (p *Parser) parseDelete() (Statement, error) {
-        if err := p.consumeKeyword("DELETE"); err != nil {
-                return nil, err
-        }
-        if err := p.consumeKeyword("FROM"); err != nil {
-                return nil, err
-        }
-        if p.curToken.Type != lexer.Ident {
-                return nil, fmt.Errorf("parser: expected table name after DELETE FROM")
-        }
-        table := p.curToken.Literal
-        p.nextToken()
-        var where Expression
-        if strings.ToUpper(p.curToken.Literal) == "WHERE" {
-                p.nextToken()
-                var err error
-                where, err = p.parseExpression(lowestPrecedence)
-                if err != nil {
-                        return nil, err
-                }
-        }
-        return &DeleteStmt{Table: table, Where: where}, nil
+	if err := p.consumeKeyword("DELETE"); err != nil {
+		return nil, err
+	}
+	if err := p.consumeKeyword("FROM"); err != nil {
+		return nil, err
+	}
+	if p.curToken.Type != lexer.Ident {
+		return nil, fmt.Errorf("parser: expected table name after DELETE FROM")
+	}
+	table := p.curToken.Literal
+	p.nextToken()
+	var where Expression
+	if strings.ToUpper(p.curToken.Literal) == "WHERE" {
+		p.nextToken()
+		var err error
+		where, err = p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &DeleteStmt{Table: table, Where: where}, nil
 }
 
 func (p *Parser) parseSelect() (Statement, error) {
-        if err := p.consumeKeyword("SELECT"); err != nil {
-                return nil, err
-        }
-        items, err := p.parseSelectItems()
+	if err := p.consumeKeyword("SELECT"); err != nil {
+		return nil, err
+	}
+	items, err := p.parseSelectItems()
 	if err != nil {
 		return nil, err
 	}

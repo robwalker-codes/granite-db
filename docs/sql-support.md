@@ -1,9 +1,9 @@
 # SQL support
 
-GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 4
-builds upon the Stage 3 grouping, aggregation, and ordering work by adding
-secondary indexes, unique constraints, and planner heuristics while retaining
-the existing expression grammar and join pipeline.
+GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 6
+extends the earlier indexing, constraint, and execution work with explicit
+transactions, a lock manager, and Read Committed isolation while retaining the
+existing expression grammar and join pipeline.
 
 ## Projection expressions
 
@@ -164,6 +164,33 @@ executor enforces `RESTRICT`/`NO ACTION` semantics immediately:
   values. When a child index exists on the foreign key columns the executor uses
   it to probe quickly before falling back to a heap scan.
 * Child keys containing only `NULL` values are allowed.
+
+## Transactions and locking
+
+GraniteDB defaults to autocommit: each statement runs in its own transaction and
+commits automatically on success. Explicit control is available via:
+
+```
+BEGIN; -- also BEGIN TRANSACTION or START TRANSACTION
+COMMIT; -- also COMMIT TRANSACTION
+ROLLBACK; -- also ROLLBACK TRANSACTION
+```
+
+Once a transaction is active subsequent statements on the same session reuse it
+until a matching `COMMIT` or `ROLLBACK`. Concurrent sessions continue to use
+autocommit unless they explicitly begin their own transaction.
+
+The engine enforces Read Committed isolation. Each statement observes a
+consistent snapshot of the database at the moment the statement starts, and
+writes only become visible after the owning transaction commits. Non-repeatable
+reads and phantoms are therefore possible, but dirty reads are prevented.
+
+Locking is performed using shared table locks for readers and exclusive table
+plus row locks for writers. Conflicting lock requests wait until the holder
+releases the resource or a two second timeout elapses, in which case the system
+returns a descriptive error such as `lock timeout on table orders`. Locks are
+released automatically on commit, rollback, or when an autocommit statement
+completes.
 
 ## Known limitations
 

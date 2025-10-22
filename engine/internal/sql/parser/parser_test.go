@@ -446,3 +446,48 @@ func TestCreateIndexRequiresColumn(t *testing.T) {
 		t.Fatalf("expected parse error for empty column list")
 	}
 }
+
+func TestTransactionStatementParsing(t *testing.T) {
+	cases := map[string]func(parser.Statement) bool{
+		"BEGIN": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.BeginStmt)
+			return ok
+		},
+		"BEGIN TRANSACTION": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.BeginStmt)
+			return ok
+		},
+		"START TRANSACTION": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.BeginStmt)
+			return ok
+		},
+		"COMMIT": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.CommitStmt)
+			return ok
+		},
+		"COMMIT TRANSACTION": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.CommitStmt)
+			return ok
+		},
+		"ROLLBACK": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.RollbackStmt)
+			return ok
+		},
+		"ROLLBACK TRANSACTION": func(stmt parser.Statement) bool {
+			_, ok := stmt.(*parser.RollbackStmt)
+			return ok
+		},
+	}
+	for sql, check := range cases {
+		stmt, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		if !check(stmt) {
+			t.Fatalf("%q: unexpected statement type %T", sql, stmt)
+		}
+	}
+	if _, err := parser.Parse("START"); err == nil {
+		t.Fatalf("expected START without TRANSACTION to fail")
+	}
+}
