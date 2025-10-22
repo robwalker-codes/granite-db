@@ -1,19 +1,21 @@
 package api
 
 import (
-	"fmt"
+        "fmt"
 
-	"github.com/example/granite-db/engine/internal/catalog"
-	"github.com/example/granite-db/engine/internal/exec"
-	"github.com/example/granite-db/engine/internal/sql/parser"
-	"github.com/example/granite-db/engine/internal/storage"
+        "github.com/example/granite-db/engine/internal/catalog"
+        "github.com/example/granite-db/engine/internal/exec"
+        "github.com/example/granite-db/engine/internal/sql/parser"
+        "github.com/example/granite-db/engine/internal/storage"
+        "github.com/example/granite-db/engine/internal/storage/indexmgr"
 )
 
 // Database provides a public façade over the GraniteDB engine.
 type Database struct {
-	storage  *storage.Manager
-	catalog  *catalog.Catalog
-	executor *exec.Executor
+        storage  *storage.Manager
+        catalog  *catalog.Catalog
+        executor *exec.Executor
+        indexes  *indexmgr.Manager
 }
 
 // Create initialises a new GraniteDB database file at the given path.
@@ -23,26 +25,30 @@ func Create(path string) error {
 
 // Open loads an existing database and prepares it for SQL execution.
 func Open(path string) (*Database, error) {
-	mgr, err := storage.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	cat, err := catalog.Load(mgr)
-	if err != nil {
-		mgr.Close()
-		return nil, err
-	}
-	return &Database{storage: mgr, catalog: cat, executor: exec.New(cat, mgr)}, nil
+        mgr, err := storage.Open(path)
+        if err != nil {
+                return nil, err
+        }
+        cat, err := catalog.Load(mgr)
+        if err != nil {
+                mgr.Close()
+                return nil, err
+        }
+        idx := indexmgr.New(mgr.Path())
+        return &Database{storage: mgr, catalog: cat, executor: exec.New(cat, mgr, idx), indexes: idx}, nil
 }
 
 // Close flushes data and releases resources.
 func (db *Database) Close() error {
-	if db.storage == nil {
-		return nil
-	}
-	err := db.storage.Close()
-	db.storage = nil
-	return err
+        if db.storage == nil {
+                return nil
+        }
+        if db.indexes != nil {
+                _ = db.indexes.Close()
+        }
+        err := db.storage.Close()
+        db.storage = nil
+        return err
 }
 
 // Execute parses and executes the provided SQL statement string.

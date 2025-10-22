@@ -336,3 +336,57 @@ func TestParseAggregateFunctions(t *testing.T) {
 		t.Fatalf("expected column reference argument for COUNT(DISTINCT ...)")
 	}
 }
+
+func TestCreateIndexParsing(t *testing.T) {
+        stmt, err := parser.Parse("CREATE INDEX idx_total ON orders(total);")
+        if err != nil {
+                t.Fatalf("parse: %v", err)
+        }
+        create, ok := stmt.(*parser.CreateIndexStmt)
+        if !ok {
+                t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+        }
+        if create.Name != "idx_total" || create.Table != "orders" {
+                t.Fatalf("unexpected definition: %+v", create)
+        }
+        if create.Unique {
+                t.Fatalf("expected non-unique index")
+        }
+        if len(create.Columns) != 1 || create.Columns[0] != "total" {
+                t.Fatalf("unexpected columns: %+v", create.Columns)
+        }
+}
+
+func TestCreateUniqueIndexParsing(t *testing.T) {
+        stmt, err := parser.Parse("CREATE UNIQUE INDEX idx_name ON customers(name);")
+        if err != nil {
+                t.Fatalf("parse: %v", err)
+        }
+        create := stmt.(*parser.CreateIndexStmt)
+        if !create.Unique {
+                t.Fatalf("expected UNIQUE flag")
+        }
+        if create.Table != "customers" {
+                t.Fatalf("unexpected table %s", create.Table)
+        }
+}
+
+func TestDropIndexParsing(t *testing.T) {
+        stmt, err := parser.Parse("DROP INDEX idx_total;")
+        if err != nil {
+                t.Fatalf("parse: %v", err)
+        }
+        drop, ok := stmt.(*parser.DropIndexStmt)
+        if !ok {
+                t.Fatalf("expected DropIndexStmt, got %T", stmt)
+        }
+        if drop.Name != "idx_total" {
+                t.Fatalf("unexpected index %s", drop.Name)
+        }
+}
+
+func TestCreateIndexRequiresColumn(t *testing.T) {
+        if _, err := parser.Parse("CREATE INDEX idx ON orders();"); err == nil {
+                t.Fatalf("expected parse error for empty column list")
+        }
+}

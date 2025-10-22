@@ -1,8 +1,9 @@
 package catalog_test
 
 import (
-	"path/filepath"
-	"testing"
+        "path/filepath"
+        "strings"
+        "testing"
 
 	"github.com/example/granite-db/engine/internal/catalog"
 	"github.com/example/granite-db/engine/internal/storage"
@@ -103,4 +104,64 @@ func TestCatalogPersistDecimalMetadata(t *testing.T) {
 	if balance.Precision != 18 || balance.Scale != 4 {
 		t.Fatalf("unexpected precision/scale: %d/%d", balance.Precision, balance.Scale)
 	}
+}
+
+func TestCatalogPersistIndexes(t *testing.T) {
+        dir := t.TempDir()
+        path := filepath.Join(dir, "idx.gdb")
+        if err := storage.New(path); err != nil {
+                t.Fatalf("create db: %v", err)
+        }
+        mgr, err := storage.Open(path)
+        if err != nil {
+                t.Fatalf("open db: %v", err)
+        }
+        cat, err := catalog.Load(mgr)
+        if err != nil {
+                t.Fatalf("load catalog: %v", err)
+        }
+        cols := []catalog.Column{{Name: "id", Type: catalog.ColumnTypeInt, NotNull: true}, {Name: "name", Type: catalog.ColumnTypeVarChar, Length: 32}}
+        if _, err := cat.CreateTable("people", cols, "id"); err != nil {
+                t.Fatalf("create table: %v", err)
+        }
+        if _, err := cat.CreateIndex("people", "idx_people_name", []string{"name"}, true); err != nil {
+                t.Fatalf("create index: %v", err)
+        }
+        mgr.Close()
+
+        mgr, err = storage.Open(path)
+        if err != nil {
+                t.Fatalf("reopen db: %v", err)
+        }
+        defer mgr.Close()
+        cat, err = catalog.Load(mgr)
+        if err != nil {
+                t.Fatalf("reload catalog: %v", err)
+        }
+        table, ok := cat.GetTable("people")
+        if !ok {
+                t.Fatalf("expected people table present")
+        }
+        if len(table.Indexes) != 1 {
+                t.Fatalf("expected 1 index, got %d", len(table.Indexes))
+        }
+        idx, ok := table.Indexes["idx_people_name"]
+        if !ok {
+                for name := range table.Indexes {
+                        if strings.EqualFold(name, "idx_people_name") {
+                                idx = table.Indexes[name]
+                                ok = true
+                                break
+                        }
+                }
+        }
+        if !ok {
+                t.Fatalf("expected idx_people_name present")
+        }
+        if !idx.IsUnique {
+                t.Fatalf("expected unique index")
+        }
+        if len(idx.Columns) != 1 || idx.Columns[0] != "name" {
+                t.Fatalf("unexpected columns: %+v", idx.Columns)
+        }
 }

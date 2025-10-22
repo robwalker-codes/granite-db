@@ -1,13 +1,14 @@
 package main
 
 import (
-	"encoding/csv"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"io"
-	"os"
-	"strings"
+        "encoding/csv"
+        "encoding/json"
+        "flag"
+        "fmt"
+        "io"
+        "os"
+        "sort"
+        "strings"
 
 	"github.com/example/granite-db/engine/internal/api"
 	"github.com/example/granite-db/engine/internal/catalog"
@@ -137,20 +138,37 @@ func runDump(args []string) {
 		fmt.Println("No tables defined")
 		return
 	}
-	for _, table := range tables {
-		fmt.Printf("Table %s (%d row(s))\n", table.Name, table.RowCount)
-		for _, col := range table.Columns {
-			fmt.Printf("  - %s %s", col.Name, describeType(col))
-			if col.NotNull {
-				fmt.Print(" NOT NULL")
-			}
-			if col.PrimaryKey {
-				fmt.Print(" PRIMARY KEY")
-			}
-			fmt.Println()
-		}
-		fmt.Println()
-	}
+        for _, table := range tables {
+                fmt.Printf("Table %s (%d row(s))\n", table.Name, table.RowCount)
+                for _, col := range table.Columns {
+                        fmt.Printf("  - %s %s", col.Name, describeType(col))
+                        if col.NotNull {
+                                fmt.Print(" NOT NULL")
+                        }
+                        if col.PrimaryKey {
+                                fmt.Print(" PRIMARY KEY")
+                        }
+                        fmt.Println()
+                }
+                if len(table.Indexes) > 0 {
+                        fmt.Println("  Indexes:")
+                        indexes := make([]*catalog.Index, 0, len(table.Indexes))
+                        for _, idx := range table.Indexes {
+                                indexes = append(indexes, idx)
+                        }
+                        sort.Slice(indexes, func(i, j int) bool {
+                                return strings.ToLower(indexes[i].Name) < strings.ToLower(indexes[j].Name)
+                        })
+                        for _, idx := range indexes {
+                                fmt.Printf("    - %s (%s)", idx.Name, strings.Join(idx.Columns, ", "))
+                                if idx.IsUnique {
+                                        fmt.Print(" UNIQUE")
+                                }
+                                fmt.Println()
+                        }
+                }
+                fmt.Println()
+        }
 }
 
 func runExplain(args []string) {

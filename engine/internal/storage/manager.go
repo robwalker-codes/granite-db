@@ -42,17 +42,18 @@ const headerSize = 8 + 2 + 2 + 4 + 4 + 4
 // Manager coordinates access to the on-disk database file and handles page
 // allocation, deallocation and catalog persistence.
 type Manager struct {
-	mu           sync.Mutex
-	file         *os.File
-	header       databaseHeader
-	catalogCache []byte
+        mu           sync.Mutex
+        file         *os.File
+        header       databaseHeader
+        catalogCache []byte
+        path         string
 }
 
 // New creates a brand-new GraniteDB database file.
 func New(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("storage: database %s already exists", path)
-	}
+        if _, err := os.Stat(path); err == nil {
+                return fmt.Errorf("storage: database %s already exists", path)
+        }
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
@@ -76,12 +77,12 @@ func New(path string) error {
 
 // Open loads an existing database file.
 func Open(path string) (*Manager, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
+        f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+        if err != nil {
+                return nil, err
+        }
 
-	m := &Manager{file: f}
+        m := &Manager{file: f, path: path}
 	if err := m.loadHeader(); err != nil {
 		f.Close()
 		return nil, err
@@ -121,9 +122,14 @@ func (m *Manager) Close() error {
 	if err := m.flushHeaderLocked(nil); err != nil {
 		return err
 	}
-	err := m.file.Close()
-	m.file = nil
-	return err
+        err := m.file.Close()
+        m.file = nil
+        return err
+}
+
+// Path returns the on-disk location of the database file.
+func (m *Manager) Path() string {
+        return m.path
 }
 
 // CatalogData returns a copy of the persisted catalog payload from page 0.

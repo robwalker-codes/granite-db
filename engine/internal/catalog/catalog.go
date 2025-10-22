@@ -1,11 +1,12 @@
 package catalog
 
 import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
-	"sort"
-	"strings"
+        "bytes"
+        "encoding/binary"
+        "fmt"
+        "io"
+        "sort"
+        "strings"
 
 	"github.com/example/granite-db/engine/internal/storage"
 )
@@ -35,6 +36,7 @@ type Column struct {
 }
 
 const maxColumnLength = 0xFFFF
+const indexSectionMarker = 0xFFFF
 
 func encodeColumnMetadata(col Column) (uint16, error) {
 	switch col.Type {
@@ -95,10 +97,18 @@ func decodeColumnMetadata(colType ColumnType, raw uint16) (length int, precision
 
 // Table captures metadata for a user table.
 type Table struct {
-	Name     string
-	Columns  []Column
-	RootPage storage.PageID
-	RowCount uint64
+        Name     string
+        Columns  []Column
+        RootPage storage.PageID
+        RowCount uint64
+        Indexes  map[string]*Index
+}
+
+// Index describes a secondary index definition.
+type Index struct {
+        Name     string
+        Columns  []string
+        IsUnique bool
 }
 
 // Catalog holds definitions of all tables within the database.
@@ -182,38 +192,136 @@ func Load(mgr *storage.Manager) (*Catalog, error) {
 		if primaryIndex >= 0 && int(primaryIndex) < len(cols) {
 			cols[primaryIndex].PrimaryKey = true
 		}
-		table := &Table{
-			Name:     name,
-			Columns:  cols,
-			RootPage: storage.PageID(rootPage),
-			RowCount: rowCount,
-		}
-		cat.tables[strings.ToLower(name)] = table
+        table := &Table{
+                Name:     name,
+                Columns:  cols,
+                RootPage: storage.PageID(rootPage),
+                RowCount: rowCount,
+                Indexes:  make(map[string]*Index),
+        }
+        if err := readIndexMetadata(reader, table); err != nil {
+                return nil, err
+        }
+        cat.tables[strings.ToLower(name)] = table
 	}
 	return cat, nil
 }
 
 func readString(r *bytes.Reader) (string, error) {
-	var length uint16
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return "", err
-	}
-	data := make([]byte, length)
-	if _, err := r.Read(data); err != nil {
-		return "", err
-	}
-	return string(data), nil
+        var length uint16
+        if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
+                return "", err
+        }
+        data := make([]byte, length)
+        if _, err := r.Read(data); err != nil {
+                return "", err
+        }
+        return string(data), nil
+}
+
+func readIndexMetadata(r *bytes.Reader, table *Table) error {
+        pos, err := r.Seek(0, io.SeekCurrent)
+        if err != nil {
+                return err
+        }
+        var marker uint16
+        if err := binary.Read(r, binary.LittleEndian, &marker); err != nil {
+                if err == io.EOF {
+                        return nil
+                }
+                return err
+        }
+        if marker != indexSectionMarker {
+                if _, err := r.Seek(pos, io.SeekStart); err != nil {
+                        return err
+                }
+                return nil
+        }
+        var count uint16
+        if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+                return err
+        }
+        for i := uint16(0); i < count; i++ {
+                name, err := readString(r)
+                if err != nil {
+                        return err
+                }
+                var unique uint8
+                if err := binary.Read(r, binary.LittleEndian, &unique); err != nil {
+                        return err
+                }
+                var colCount uint16
+                if err := binary.Read(r, binary.LittleEndian, &colCount); err != nil {
+                        return err
+                }
+                cols := make([]string, colCount)
+                for j := uint16(0); j < colCount; j++ {
+                        colName, err := readString(r)
+                        if err != nil {
+                                return err
+                        }
+                        cols[j] = colName
+                }
+                table.Indexes[strings.ToLower(name)] = &Index{Name: name, Columns: cols, IsUnique: unique == 1}
+        }
+        return nil
 }
 
 func writeString(buf *bytes.Buffer, value string) error {
-	if len(value) > 0xFFFF {
-		return fmt.Errorf("catalog: string too long")
-	}
-	if err := binary.Write(buf, binary.LittleEndian, uint16(len(value))); err != nil {
-		return err
-	}
-	_, err := buf.WriteString(value)
-	return err
+        if len(value) > 0xFFFF {
+                return fmt.Errorf("catalog: string too long")
+        }
+        if err := binary.Write(buf, binary.LittleEndian, uint16(len(value))); err != nil {
+                return err
+        }
+        _, err := buf.WriteString(value)
+        return err
+}
+
+func writeIndexMetadata(buf *bytes.Buffer, table *Table) error {
+        if err := binary.Write(buf, binary.LittleEndian, indexSectionMarker); err != nil {
+                return err
+        }
+        count := uint16(0)
+        if table.Indexes != nil {
+                count = uint16(len(table.Indexes))
+        }
+        if err := binary.Write(buf, binary.LittleEndian, count); err != nil {
+                return err
+        }
+        if count == 0 {
+                return nil
+        }
+        names := make([]string, 0, len(table.Indexes))
+        for _, idx := range table.Indexes {
+                names = append(names, idx.Name)
+        }
+        sort.Strings(names)
+        for _, name := range names {
+                idx := table.Indexes[strings.ToLower(name)]
+                if idx == nil {
+                        continue
+                }
+                if err := writeString(buf, idx.Name); err != nil {
+                        return err
+                }
+                var unique uint8
+                if idx.IsUnique {
+                        unique = 1
+                }
+                if err := binary.Write(buf, binary.LittleEndian, unique); err != nil {
+                        return err
+                }
+                if err := binary.Write(buf, binary.LittleEndian, uint16(len(idx.Columns))); err != nil {
+                        return err
+                }
+                for _, col := range idx.Columns {
+                        if err := writeString(buf, col); err != nil {
+                                return err
+                        }
+                }
+        }
+        return nil
 }
 
 func (c *Catalog) persist() error {
@@ -251,12 +359,12 @@ func (c *Catalog) persist() error {
 		if err := binary.Write(buf, binary.LittleEndian, primaryIndex); err != nil {
 			return err
 		}
-		for _, col := range table.Columns {
-			if err := writeString(buf, col.Name); err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.LittleEndian, uint8(col.Type)); err != nil {
-				return err
+        for _, col := range table.Columns {
+                if err := writeString(buf, col.Name); err != nil {
+                        return err
+                }
+                if err := binary.Write(buf, binary.LittleEndian, uint8(col.Type)); err != nil {
+                        return err
 			}
 			meta, err := encodeColumnMetadata(col)
 			if err != nil {
@@ -272,9 +380,12 @@ func (c *Catalog) persist() error {
 			if err := binary.Write(buf, binary.LittleEndian, notNull); err != nil {
 				return err
 			}
-		}
-	}
-	return c.storage.UpdateCatalog(buf.Bytes())
+                }
+        }
+        if err := writeIndexMetadata(buf, table); err != nil {
+                return err
+        }
+        return c.storage.UpdateCatalog(buf.Bytes())
 }
 
 // CreateTable registers a new table and allocates its first heap page.
@@ -316,12 +427,13 @@ func (c *Catalog) CreateTable(name string, columns []Column, primaryKey string) 
 	if err := c.storage.WritePage(rootID, buf); err != nil {
 		return nil, err
 	}
-	table := &Table{
-		Name:     name,
-		Columns:  cols,
-		RootPage: rootID,
-		RowCount: 0,
-	}
+        table := &Table{
+                Name:     name,
+                Columns:  cols,
+                RootPage: rootID,
+                RowCount: 0,
+                Indexes:  make(map[string]*Index),
+        }
 	c.tables[lower] = table
 	if err := c.persist(); err != nil {
 		delete(c.tables, lower)
@@ -359,24 +471,118 @@ func (c *Catalog) GetTable(name string) (*Table, bool) {
 
 // ListTables returns table metadata snapshots in name order.
 func (c *Catalog) ListTables() []*Table {
-	names := make([]string, 0, len(c.tables))
-	for name := range c.tables {
-		names = append(names, name)
-	}
+        names := make([]string, 0, len(c.tables))
+        for name := range c.tables {
+                names = append(names, name)
+        }
 	sort.Strings(names)
 	result := make([]*Table, 0, len(names))
-	for _, lower := range names {
-		table := c.tables[lower]
-		copyCols := make([]Column, len(table.Columns))
-		copy(copyCols, table.Columns)
-		result = append(result, &Table{
-			Name:     table.Name,
-			Columns:  copyCols,
-			RootPage: table.RootPage,
-			RowCount: table.RowCount,
-		})
-	}
-	return result
+        for _, lower := range names {
+                table := c.tables[lower]
+                copyCols := make([]Column, len(table.Columns))
+                copy(copyCols, table.Columns)
+                copyIdx := make(map[string]*Index, len(table.Indexes))
+                if len(table.Indexes) > 0 {
+                        for key, idx := range table.Indexes {
+                                cols := make([]string, len(idx.Columns))
+                                copy(cols, idx.Columns)
+                                copyIdx[key] = &Index{Name: idx.Name, Columns: cols, IsUnique: idx.IsUnique}
+                        }
+                }
+                result = append(result, &Table{
+                        Name:     table.Name,
+                        Columns:  copyCols,
+                        RootPage: table.RootPage,
+                        RowCount: table.RowCount,
+                        Indexes:  copyIdx,
+                })
+        }
+        return result
+}
+
+// CreateIndex registers a new index definition on an existing table.
+func (c *Catalog) CreateIndex(tableName, indexName string, columns []string, unique bool) (*Index, error) {
+        table, ok := c.tables[strings.ToLower(tableName)]
+        if !ok {
+                return nil, fmt.Errorf("catalog: table %s not found", tableName)
+        }
+        if table.Indexes == nil {
+                table.Indexes = make(map[string]*Index)
+        }
+        lower := strings.ToLower(indexName)
+        if _, exists := table.Indexes[lower]; exists {
+                return nil, fmt.Errorf("catalog: index %s already exists on table %s", indexName, tableName)
+        }
+        resolved := make([]string, len(columns))
+        for i, name := range columns {
+                        found := false
+                        for _, col := range table.Columns {
+                                if strings.EqualFold(col.Name, name) {
+                                        resolved[i] = col.Name
+                                        found = true
+                                        break
+                                }
+                        }
+                        if !found {
+                                return nil, fmt.Errorf("catalog: column %s not found in table %s", name, tableName)
+                        }
+        }
+        idx := &Index{Name: indexName, Columns: resolved, IsUnique: unique}
+        table.Indexes[lower] = idx
+        if err := c.persist(); err != nil {
+                delete(table.Indexes, lower)
+                return nil, err
+        }
+        return idx, nil
+}
+
+// DropIndex removes an index definition from the catalog.
+func (c *Catalog) DropIndex(tableName, indexName string) error {
+        table, ok := c.tables[strings.ToLower(tableName)]
+        if !ok {
+                return fmt.Errorf("catalog: table %s not found", tableName)
+        }
+        lower := strings.ToLower(indexName)
+        if _, exists := table.Indexes[lower]; !exists {
+                return fmt.Errorf("catalog: index %s not found on table %s", indexName, tableName)
+        }
+        delete(table.Indexes, lower)
+        return c.persist()
+}
+
+// FindIndex locates an index by name across all tables.
+func (c *Catalog) FindIndex(name string) (*Table, *Index, bool) {
+        lower := strings.ToLower(name)
+        for _, table := range c.tables {
+                if idx, ok := table.Indexes[lower]; ok {
+                        return table, idx, true
+                }
+        }
+        return nil, nil, false
+}
+
+// TableIndexes returns copies of the index definitions for the specified table.
+func (c *Catalog) TableIndexes(tableName string) []*Index {
+        table, ok := c.tables[strings.ToLower(tableName)]
+        if !ok || len(table.Indexes) == 0 {
+                return nil
+        }
+        names := make([]string, 0, len(table.Indexes))
+        for _, idx := range table.Indexes {
+                names = append(names, idx.Name)
+        }
+        sort.Strings(names)
+        result := make([]*Index, 0, len(names))
+        for _, name := range names {
+                idx := table.Indexes[strings.ToLower(name)]
+                if idx == nil {
+                        continue
+                }
+                cols := make([]string, len(idx.Columns))
+                copy(cols, idx.Columns)
+                result = append(result, &Index{Name: idx.Name, Columns: cols, IsUnique: idx.IsUnique})
+        }
+        return result
 }
 
 // IncrementRowCount increases the stored row count for the table.
