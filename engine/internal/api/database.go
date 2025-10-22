@@ -1,21 +1,30 @@
 package api
 
 import (
-        "fmt"
+	"fmt"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 
-        "github.com/example/granite-db/engine/internal/catalog"
-        "github.com/example/granite-db/engine/internal/exec"
-        "github.com/example/granite-db/engine/internal/sql/parser"
-        "github.com/example/granite-db/engine/internal/storage"
-        "github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/catalog"
+	"github.com/example/granite-db/engine/internal/exec"
+	"github.com/example/granite-db/engine/internal/sql/parser"
+	"github.com/example/granite-db/engine/internal/storage"
+	"github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/txn"
 )
 
 // Database provides a public façade over the GraniteDB engine.
 type Database struct {
-        storage  *storage.Manager
-        catalog  *catalog.Catalog
-        executor *exec.Executor
-        indexes  *indexmgr.Manager
+	storage  *storage.Manager
+	catalog  *catalog.Catalog
+	executor *exec.Executor
+	indexes  *indexmgr.Manager
+	locks    *txn.LockManager
+	txns     *txn.Manager
+	mu       sync.Mutex
+	sessions map[int64]*txn.Transaction
 }
 
 // Create initialises a new GraniteDB database file at the given path.
@@ -25,30 +34,40 @@ func Create(path string) error {
 
 // Open loads an existing database and prepares it for SQL execution.
 func Open(path string) (*Database, error) {
-        mgr, err := storage.Open(path)
-        if err != nil {
-                return nil, err
-        }
-        cat, err := catalog.Load(mgr)
-        if err != nil {
-                mgr.Close()
-                return nil, err
-        }
-        idx := indexmgr.New(mgr.Path())
-        return &Database{storage: mgr, catalog: cat, executor: exec.New(cat, mgr, idx), indexes: idx}, nil
+	mgr, err := storage.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	cat, err := catalog.Load(mgr)
+	if err != nil {
+		mgr.Close()
+		return nil, err
+	}
+	idx := indexmgr.New(mgr.Path())
+	locks := txn.NewLockManager(0)
+	txns := txn.NewManager(locks)
+	return &Database{
+		storage:  mgr,
+		catalog:  cat,
+		executor: exec.New(cat, mgr, idx, locks),
+		indexes:  idx,
+		locks:    locks,
+		txns:     txns,
+		sessions: make(map[int64]*txn.Transaction),
+	}, nil
 }
 
 // Close flushes data and releases resources.
 func (db *Database) Close() error {
-        if db.storage == nil {
-                return nil
-        }
-        if db.indexes != nil {
-                _ = db.indexes.Close()
-        }
-        err := db.storage.Close()
-        db.storage = nil
-        return err
+	if db.storage == nil {
+		return nil
+	}
+	if db.indexes != nil {
+		_ = db.indexes.Close()
+	}
+	err := db.storage.Close()
+	db.storage = nil
+	return err
 }
 
 // Execute parses and executes the provided SQL statement string.
@@ -57,9 +76,94 @@ func (db *Database) Execute(sql string) (*exec.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := db.executor.Execute(stmt)
-	if err != nil {
+	session := currentSessionID()
+	switch stmt.(type) {
+	case *parser.BeginStmt:
+		return db.begin(session)
+	case *parser.CommitStmt:
+		return db.commit(session)
+	case *parser.RollbackStmt:
+		return db.rollback(session)
+	default:
+		return db.executeStatement(session, stmt)
+	}
+}
+
+func (db *Database) begin(session int64) (*exec.Result, error) {
+	if db.txns == nil {
+		return nil, fmt.Errorf("api: transaction support unavailable")
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if _, ok := db.sessions[session]; ok {
+		return nil, fmt.Errorf("api: transaction already active")
+	}
+	tx := db.txns.Begin()
+	db.sessions[session] = tx
+	return &exec.Result{Message: "Transaction started"}, nil
+}
+
+func (db *Database) commit(session int64) (*exec.Result, error) {
+	if db.txns == nil {
+		return nil, fmt.Errorf("api: transaction support unavailable")
+	}
+	tx := db.sessionTxn(session)
+	if tx == nil {
+		return nil, fmt.Errorf("api: no active transaction")
+	}
+	if err := db.txns.Commit(tx.ID()); err != nil {
 		return nil, err
+	}
+	db.clearSession(session)
+	return &exec.Result{Message: "Transaction committed"}, nil
+}
+
+func (db *Database) rollback(session int64) (*exec.Result, error) {
+	if db.txns == nil {
+		return nil, fmt.Errorf("api: transaction support unavailable")
+	}
+	tx := db.sessionTxn(session)
+	if tx == nil {
+		return nil, fmt.Errorf("api: no active transaction")
+	}
+	if err := db.txns.Rollback(tx.ID()); err != nil {
+		return nil, err
+	}
+	db.clearSession(session)
+	return &exec.Result{Message: "Transaction rolled back"}, nil
+}
+
+func (db *Database) executeStatement(session int64, stmt parser.Statement) (*exec.Result, error) {
+	if db.executor == nil {
+		return nil, fmt.Errorf("api: database not open")
+	}
+	var (
+		tx         *txn.Transaction
+		autocommit bool
+	)
+	if existing := db.sessionTxn(session); existing != nil {
+		tx = existing
+	} else {
+		if db.txns == nil {
+			return nil, fmt.Errorf("api: transaction support unavailable")
+		}
+		tx = db.txns.Begin()
+		tx.SetAutocommit(true)
+		autocommit = true
+	}
+	res, err := db.executor.Execute(tx, stmt)
+	if err != nil {
+		if autocommit {
+			if rbErr := db.txns.Rollback(tx.ID()); rbErr != nil {
+				return nil, fmt.Errorf("api: rollback failed after error: %v (original: %w)", rbErr, err)
+			}
+		}
+		return nil, err
+	}
+	if autocommit {
+		if err := db.txns.Commit(tx.ID()); err != nil {
+			return nil, err
+		}
 	}
 	return res, nil
 }
@@ -83,4 +187,33 @@ func (db *Database) Tables() ([]*catalog.Table, error) {
 		return nil, fmt.Errorf("api: database not open")
 	}
 	return db.catalog.ListTables(), nil
+}
+
+func (db *Database) sessionTxn(session int64) *txn.Transaction {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.sessions[session]
+}
+
+func (db *Database) clearSession(session int64) {
+	db.mu.Lock()
+	delete(db.sessions, session)
+	db.mu.Unlock()
+}
+
+func currentSessionID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	if n <= 0 {
+		return 0
+	}
+	fields := strings.Fields(string(buf[:n]))
+	if len(fields) < 2 {
+		return 0
+	}
+	id, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }

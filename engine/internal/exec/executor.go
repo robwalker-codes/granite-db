@@ -17,6 +17,7 @@ import (
 	"github.com/example/granite-db/engine/internal/sql/validator"
 	"github.com/example/granite-db/engine/internal/storage"
 	"github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/txn"
 )
 
 // Result describes the outcome of executing a SQL statement.
@@ -32,6 +33,7 @@ type Executor struct {
 	catalog *catalog.Catalog
 	storage *storage.Manager
 	indexes *indexmgr.Manager
+	locks   *txn.LockManager
 }
 
 type indexInfo struct {
@@ -79,29 +81,47 @@ type referencingForeignKey struct {
 var errStopScan = errors.New("stop scan")
 
 // New creates an executor for the given catalog and storage manager.
-func New(cat *catalog.Catalog, mgr *storage.Manager, idx *indexmgr.Manager) *Executor {
-	return &Executor{catalog: cat, storage: mgr, indexes: idx}
+func New(cat *catalog.Catalog, mgr *storage.Manager, idx *indexmgr.Manager, locks *txn.LockManager) *Executor {
+	return &Executor{catalog: cat, storage: mgr, indexes: idx, locks: locks}
+}
+
+func (e *Executor) acquireTableLock(tx *txn.Transaction, table string, mode txn.LockMode) error {
+	if e.locks == nil {
+		return nil
+	}
+	return e.locks.Acquire(tx, txn.TableResource(table), mode)
+}
+
+func (e *Executor) acquireRowLock(tx *txn.Transaction, table string, rid storage.RowID, mode txn.LockMode) error {
+	if e.locks == nil {
+		return nil
+	}
+	key := fmt.Sprintf("%d:%d", rid.Page, rid.Slot)
+	return e.locks.Acquire(tx, txn.RowResource(table, key), mode)
 }
 
 // Execute runs the provided AST statement and returns a result summary.
-func (e *Executor) Execute(stmt parser.Statement) (*Result, error) {
+func (e *Executor) Execute(tx *txn.Transaction, stmt parser.Statement) (*Result, error) {
+	if tx == nil {
+		return nil, fmt.Errorf("exec: transaction context required")
+	}
 	switch s := stmt.(type) {
 	case *parser.CreateTableStmt:
-		return e.executeCreateTable(s)
+		return e.executeCreateTable(tx, s)
 	case *parser.DropTableStmt:
-		return e.executeDropTable(s)
+		return e.executeDropTable(tx, s)
 	case *parser.CreateIndexStmt:
-		return e.executeCreateIndex(s)
+		return e.executeCreateIndex(tx, s)
 	case *parser.DropIndexStmt:
-		return e.executeDropIndex(s)
+		return e.executeDropIndex(tx, s)
 	case *parser.InsertStmt:
-		return e.executeInsert(s)
+		return e.executeInsert(tx, s)
 	case *parser.UpdateStmt:
-		return e.executeUpdate(s)
+		return e.executeUpdate(tx, s)
 	case *parser.DeleteStmt:
-		return e.executeDelete(s)
+		return e.executeDelete(tx, s)
 	case *parser.SelectStmt:
-		return e.executeSelect(s)
+		return e.executeSelect(tx, s)
 	default:
 		return nil, fmt.Errorf("exec: unsupported statement type %T", stmt)
 	}
@@ -146,7 +166,7 @@ func (e *Executor) Explain(stmt parser.Statement) (*Plan, error) {
 	}
 }
 
-func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, error) {
+func (e *Executor) executeCreateTable(_ *txn.Transaction, stmt *parser.CreateTableStmt) (*Result, error) {
 	if len(stmt.Columns) == 0 {
 		return nil, fmt.Errorf("exec: CREATE TABLE requires at least one column")
 	}
@@ -262,7 +282,7 @@ func (e *Executor) buildForeignKeys(stmt *parser.CreateTableStmt, cols []catalog
 	return result, nil
 }
 
-func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error) {
+func (e *Executor) executeDropTable(_ *txn.Transaction, stmt *parser.DropTableStmt) (*Result, error) {
 	indexes := e.catalog.TableIndexes(stmt.Name)
 	if err := e.catalog.DropTable(stmt.Name); err != nil {
 		return nil, err
@@ -275,7 +295,7 @@ func (e *Executor) executeDropTable(stmt *parser.DropTableStmt) (*Result, error)
 	return &Result{Message: fmt.Sprintf("Table %s dropped", stmt.Name)}, nil
 }
 
-func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, error) {
+func (e *Executor) executeCreateIndex(_ *txn.Transaction, stmt *parser.CreateIndexStmt) (*Result, error) {
 	table, ok := e.catalog.GetTable(stmt.Table)
 	if !ok {
 		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
@@ -343,7 +363,7 @@ func (e *Executor) executeCreateIndex(stmt *parser.CreateIndexStmt) (*Result, er
 	return &Result{Message: fmt.Sprintf("Index %s created", stmt.Name)}, nil
 }
 
-func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error) {
+func (e *Executor) executeDropIndex(_ *txn.Transaction, stmt *parser.DropIndexStmt) (*Result, error) {
 	table, idx, found := e.catalog.FindIndex(stmt.Name)
 	if !found {
 		return nil, fmt.Errorf("exec: index %s not found", stmt.Name)
@@ -357,10 +377,13 @@ func (e *Executor) executeDropIndex(stmt *parser.DropIndexStmt) (*Result, error)
 	return &Result{Message: fmt.Sprintf("Index %s dropped", idx.Name)}, nil
 }
 
-func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
+func (e *Executor) executeInsert(tx *txn.Transaction, stmt *parser.InsertStmt) (*Result, error) {
 	table, ok := e.catalog.GetTable(stmt.Table)
 	if !ok {
 		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+	}
+	if err := e.acquireTableLock(tx, table.Name, txn.LockModeExclusive); err != nil {
+		return nil, err
 	}
 	columnOrder := make([]int, len(table.Columns))
 	if len(stmt.Columns) == 0 {
@@ -417,21 +440,44 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := e.acquireRowLock(tx, table.Name, rid, txn.LockModeExclusive); err != nil {
+			_ = heap.Delete(rid)
+			return nil, err
+		}
 		if err := e.insertIntoIndexes(table, indexInfos, values, rid); err != nil {
+			_ = heap.Delete(rid)
 			return nil, err
 		}
 		if err := e.catalog.IncrementRowCount(table.Name); err != nil {
+			_ = e.removeFromIndexes(table, indexInfos, values, rid)
+			_ = heap.Delete(rid)
 			return nil, err
 		}
+		valuesCopy := cloneValues(values)
+		tx.RegisterRollback(func() error {
+			if err := e.removeFromIndexes(table, indexInfos, valuesCopy, rid); err != nil {
+				return err
+			}
+			if err := heap.Delete(rid); err != nil {
+				return err
+			}
+			if err := e.catalog.DecrementRowCount(table.Name); err != nil {
+				return err
+			}
+			return nil
+		})
 		total++
 	}
 	message := fmt.Sprintf("%d row(s) inserted", total)
 	return &Result{RowsAffected: total, Message: message}, nil
 }
 
-func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
+func (e *Executor) executeDelete(tx *txn.Transaction, stmt *parser.DeleteStmt) (*Result, error) {
 	validated, err := validator.ValidateDelete(e.catalog, stmt)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.acquireTableLock(tx, validated.Table.Name, txn.LockModeExclusive); err != nil {
 		return nil, err
 	}
 	heap := storage.NewHeapFile(e.storage, validated.Table.RootPage)
@@ -464,6 +510,9 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 				return nil
 			}
 		}
+		if err := e.acquireRowLock(tx, validated.Table.Name, rid, txn.LockModeExclusive); err != nil {
+			return err
+		}
 		for _, fk := range referencing {
 			key := extractKeyValues(values, fk.parentPositions)
 			if err := e.ensureNoReferencingRows(fk, key); err != nil {
@@ -477,8 +526,32 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 			return err
 		}
 		if err := e.catalog.DecrementRowCount(validated.Table.Name); err != nil {
+			encoded, encErr := EncodeRow(validated.Table.Columns, values)
+			if encErr == nil {
+				if restoredRID, insErr := heap.Insert(encoded); insErr == nil {
+					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
+				}
+			}
 			return err
 		}
+		valuesCopy := cloneValues(values)
+		tx.RegisterRollback(func() error {
+			encoded, err := EncodeRow(validated.Table.Columns, valuesCopy)
+			if err != nil {
+				return err
+			}
+			restoredRID, err := heap.Insert(encoded)
+			if err != nil {
+				return err
+			}
+			if err := e.insertIntoIndexes(validated.Table, indexInfos, valuesCopy, restoredRID); err != nil {
+				return err
+			}
+			if err := e.catalog.IncrementRowCount(validated.Table.Name); err != nil {
+				return err
+			}
+			return nil
+		})
 		deleted++
 		return nil
 	})
@@ -489,9 +562,12 @@ func (e *Executor) executeDelete(stmt *parser.DeleteStmt) (*Result, error) {
 	return &Result{RowsAffected: deleted, Message: message}, nil
 }
 
-func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
+func (e *Executor) executeUpdate(tx *txn.Transaction, stmt *parser.UpdateStmt) (*Result, error) {
 	validated, err := validator.ValidateUpdate(e.catalog, stmt)
 	if err != nil {
+		return nil, err
+	}
+	if err := e.acquireTableLock(tx, validated.Table.Name, txn.LockModeExclusive); err != nil {
 		return nil, err
 	}
 	heap := storage.NewHeapFile(e.storage, validated.Table.RootPage)
@@ -558,6 +634,9 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		if !changed {
 			return nil
 		}
+		if err := e.acquireRowLock(tx, validated.Table.Name, rid, txn.LockModeExclusive); err != nil {
+			return err
+		}
 		updated++
 		for _, fk := range referencing {
 			oldKey := extractKeyValues(values, fk.parentPositions)
@@ -580,18 +659,54 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 		if err := heap.Delete(rid); err != nil {
 			return err
 		}
-		encoded, err := EncodeRow(validated.Table.Columns, newValues)
+		encodedNew, err := EncodeRow(validated.Table.Columns, newValues)
 		if err != nil {
 			return err
 		}
-		newRid, err := heap.Insert(encoded)
+		newRid, err := heap.Insert(encodedNew)
 		if err != nil {
+			encodedOld, encErr := EncodeRow(validated.Table.Columns, values)
+			if encErr == nil {
+				if restoredRID, insErr := heap.Insert(encodedOld); insErr == nil {
+					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
+				}
+			}
 			return err
 		}
-		processed[newRid] = struct{}{}
 		if err := e.insertIntoIndexes(validated.Table, indexInfos, newValues, newRid); err != nil {
+			_ = e.removeFromIndexes(validated.Table, indexInfos, newValues, newRid)
+			_ = heap.Delete(newRid)
+			encodedOld, encErr := EncodeRow(validated.Table.Columns, values)
+			if encErr == nil {
+				if restoredRID, insErr := heap.Insert(encodedOld); insErr == nil {
+					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
+				}
+			}
 			return err
 		}
+		oldCopy := cloneValues(values)
+		newCopy := cloneValues(newValues)
+		tx.RegisterRollback(func() error {
+			if err := e.removeFromIndexes(validated.Table, indexInfos, newCopy, newRid); err != nil {
+				return err
+			}
+			if err := heap.Delete(newRid); err != nil {
+				return err
+			}
+			encodedOld, err := EncodeRow(validated.Table.Columns, oldCopy)
+			if err != nil {
+				return err
+			}
+			restoredRID, err := heap.Insert(encodedOld)
+			if err != nil {
+				return err
+			}
+			if err := e.insertIntoIndexes(validated.Table, indexInfos, oldCopy, restoredRID); err != nil {
+				return err
+			}
+			return nil
+		})
+		processed[newRid] = struct{}{}
 		return nil
 	})
 	if err != nil {
@@ -601,10 +716,26 @@ func (e *Executor) executeUpdate(stmt *parser.UpdateStmt) (*Result, error) {
 	return &Result{RowsAffected: updated, Message: message}, nil
 }
 
-func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
+func (e *Executor) executeSelect(tx *txn.Transaction, stmt *parser.SelectStmt) (*Result, error) {
 	validated, err := validator.ValidateSelect(e.catalog, stmt)
 	if err != nil {
 		return nil, err
+	}
+	if e.locks != nil {
+		seen := make(map[string]struct{})
+		for _, source := range validated.Sources {
+			if source == nil || source.Table == nil {
+				continue
+			}
+			name := source.Table.Name
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			if err := e.acquireTableLock(tx, name, txn.LockModeShared); err != nil {
+				return nil, err
+			}
+			seen[name] = struct{}{}
+		}
 	}
 
 	evaluator := newValueEvaluator()
@@ -1056,6 +1187,15 @@ func valuesEqualSlice(a, b []interface{}) bool {
 		}
 	}
 	return true
+}
+
+func cloneValues(values []interface{}) []interface{} {
+	if len(values) == 0 {
+		return nil
+	}
+	copied := make([]interface{}, len(values))
+	copy(copied, values)
+	return copied
 }
 
 func (e *Executor) hasReferencingRows(info referencingForeignKey, keyValues []interface{}) (bool, error) {

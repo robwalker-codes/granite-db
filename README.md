@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 5 adds immediate foreign key enforcement on top of the Stage 4 secondary indexes, preserving the earlier grouping, aggregation, and ordering work.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 6 introduces explicit transactions, Read Committed isolation, and a lock manager alongside the existing indexing, constraint, grouping, aggregation, and ordering features.
 
 ## Quick start
 
@@ -61,14 +61,24 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
-## New in Stage 5
+Explicit transactions are now available and default to autocommit when not in use:
 
-Stage 5 introduces table and column level foreign keys with immediate
-`RESTRICT`/`NO ACTION` semantics. The executor validates existing data during
-`CREATE TABLE`, checks parent keys on every insert or update, and blocks parent
-updates or deletes while children reference the old key. All previously shipped
-Stage 4 features, including secondary indexes and index-aware planning, remain
-available. A few examples:
+```bash
+cd engine
+./granitectl exec -q "BEGIN; UPDATE orders SET total = total + 10 WHERE id = 100; COMMIT;" demo.gdb
+./granitectl exec -q "BEGIN; UPDATE orders SET total = total + 100 WHERE id = 100; ROLLBACK;" demo.gdb
+```
+
+Conflicting writers wait for the holder to finish before returning a clear error such as `lock timeout on table orders` once the two second timeout expires.
+
+## New in Stage 6
+
+Stage 6 introduces explicit transaction control and a lock manager that provides
+Read Committed isolation. Statements continue to run in autocommit mode unless
+wrapped by `BEGIN`/`COMMIT` or `ROLLBACK`. Conflicting readers and writers now
+wait on table and row locks, with clear timeout errors when contention persists.
+All previously shipped features, including secondary indexes and immediate
+foreign key enforcement, remain available. A few examples:
 
 ```bash
 ./granitectl exec -q "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spend FROM customers c LEFT JOIN orders o ON c.id=o.customer_id GROUP BY c.name HAVING SUM(o.total) IS NOT NULL ORDER BY spend DESC, c.name ASC;" demo.gdb
@@ -135,13 +145,14 @@ cd engine
 * B⁺-tree indexes shared by primary and secondary keys with optional uniqueness enforcement.
 * Cost-free planner heuristics that recognise equality and range predicates and choose index scans automatically.
 * Immediate foreign key enforcement with RESTRICT/NO ACTION behaviour for both column-level and table-level declarations.
-* Write-ahead logging (REDO) with autocommit execution.
-* Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
+* Explicit transactions with Read Committed isolation, shared/exclusive table locks, row-level exclusive locks, and descriptive lock timeouts.
+* Write-ahead logging (REDO) underpinning transaction durability.
+* Command-line client for database lifecycle management, transaction-aware query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations
 
 * Joins are limited to left-deep chains of INNER and LEFT joins. No USING, RIGHT/FULL joins, or join reordering.
-* No multi-statement transactions or concurrent access safety beyond WAL-based crash recovery.
+* Isolation is limited to Read Committed and enforced via locking with timeout-based deadlock avoidance.
 * Single database file – no replication or clustering.
 * Foreign keys currently support only `RESTRICT`/`NO ACTION` referential actions. `CASCADE`, `SET NULL`, `SET DEFAULT`, and deferrable constraints are not yet available.
 * Only literal VALUES clauses are accepted in INSERT statements.
@@ -156,7 +167,7 @@ go test ./...
 ## Roadmap
 
 Future work will focus on richer join strategies, index cost estimation,
-multi-statement transactions, and observability enhancements.
+stronger isolation levels, and observability enhancements.
 
 ## Licence
 

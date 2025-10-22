@@ -1,50 +1,29 @@
 package exec_test
 
 import (
-        "path/filepath"
-        "sort"
-        "testing"
+	"path/filepath"
+	"sort"
+	"testing"
 
-        "github.com/example/granite-db/engine/internal/catalog"
-        engineexec "github.com/example/granite-db/engine/internal/exec"
-        "github.com/example/granite-db/engine/internal/sql/parser"
-        "github.com/example/granite-db/engine/internal/storage"
-        "github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/catalog"
+	engineexec "github.com/example/granite-db/engine/internal/exec"
+	"github.com/example/granite-db/engine/internal/sql/parser"
+	"github.com/example/granite-db/engine/internal/storage"
+	"github.com/example/granite-db/engine/internal/storage/indexmgr"
+	"github.com/example/granite-db/engine/internal/txn"
 )
 
 func TestExecutorSelectExpressions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "expr.gdb")
-	if err := storage.New(path); err != nil {
-		t.Fatalf("storage new: %v", err)
-	}
-	mgr, err := storage.Open(path)
-	if err != nil {
-		t.Fatalf("storage open: %v", err)
-	}
-	defer mgr.Close()
+	executor, txns, cleanup := newExecutor(t, path)
+	defer cleanup()
 
-	cat, err := catalog.Load(mgr)
-	if err != nil {
-		t.Fatalf("catalog load: %v", err)
-	}
+	mustExec(t, executor, txns, "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), nick VARCHAR(50))")
+	mustExec(t, executor, txns, "INSERT INTO people(id, name, nick) VALUES (1, 'Ada', NULL)")
+	mustExec(t, executor, txns, "INSERT INTO people(id, name, nick) VALUES (2, 'Grace', 'G')")
 
-        idx := indexmgr.New(mgr.Path())
-        defer idx.Close()
-        executor := engineexec.New(cat, mgr, idx)
-
-	mustExec(t, executor, "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), nick VARCHAR(50))")
-	mustExec(t, executor, "INSERT INTO people(id, name, nick) VALUES (1, 'Ada', NULL)")
-	mustExec(t, executor, "INSERT INTO people(id, name, nick) VALUES (2, 'Grace', 'G')")
-
-	stmt, err := parser.Parse("SELECT id+1 AS next, UPPER(name) AS uname, COALESCE(nick,name) AS display FROM people ORDER BY id")
-	if err != nil {
-		t.Fatalf("parse select: %v", err)
-	}
-	res, err := executor.Execute(stmt)
-	if err != nil {
-		t.Fatalf("execute select: %v", err)
-	}
+	res := execQuery(t, executor, txns, "SELECT id+1 AS next, UPPER(name) AS uname, COALESCE(nick,name) AS display FROM people ORDER BY id")
 	if want := []string{"next", "uname", "display"}; !equalStrings(res.Columns, want) {
 		t.Fatalf("unexpected columns: %v", res.Columns)
 	}
@@ -58,14 +37,7 @@ func TestExecutorSelectExpressions(t *testing.T) {
 		t.Fatalf("unexpected second row: %v", got)
 	}
 
-	stmt2, err := parser.Parse("SELECT 1+2*3 AS a, (1+2)*3 AS b")
-	if err != nil {
-		t.Fatalf("parse arithmetic select: %v", err)
-	}
-	res2, err := executor.Execute(stmt2)
-	if err != nil {
-		t.Fatalf("execute arithmetic select: %v", err)
-	}
+	res2 := execQuery(t, executor, txns, "SELECT 1+2*3 AS a, (1+2)*3 AS b")
 	if len(res2.Rows) != 1 {
 		t.Fatalf("expected 1 row for arithmetic query, got %d", len(res2.Rows))
 	}
@@ -77,7 +49,7 @@ func TestExecutorSelectExpressions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse invalid select: %v", err)
 	}
-	if _, err := executor.Execute(stmt3); err == nil {
+	if _, err := execParsed(t, executor, txns, stmt3); err == nil {
 		t.Fatalf("expected error for invalid function usage")
 	}
 }
@@ -85,35 +57,21 @@ func TestExecutorSelectExpressions(t *testing.T) {
 func TestExecutorJoins(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "join.gdb")
-	if err := storage.New(path); err != nil {
-		t.Fatalf("storage new: %v", err)
-	}
-	mgr, err := storage.Open(path)
-	if err != nil {
-		t.Fatalf("storage open: %v", err)
-	}
-	defer mgr.Close()
+	executor, txns, cleanup := newExecutor(t, path)
+	defer cleanup()
 
-	cat, err := catalog.Load(mgr)
-	if err != nil {
-		t.Fatalf("catalog load: %v", err)
-	}
-        idx := indexmgr.New(mgr.Path())
-        defer idx.Close()
-        executor := engineexec.New(cat, mgr, idx)
+	mustExec(t, executor, txns, "CREATE TABLE customers(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id))")
+	mustExec(t, executor, txns, "CREATE TABLE orders(id INT NOT NULL, customer_id INT, total INT, PRIMARY KEY(id))")
+	mustExec(t, executor, txns, "INSERT INTO customers(id, name) VALUES (1,'Ada'),(2,'Grace'),(3,'Lin')")
+	mustExec(t, executor, txns, "INSERT INTO orders(id, customer_id, total) VALUES (100,1,4250),(101,1,725),(200,2,9999)")
 
-	mustExec(t, executor, "CREATE TABLE customers(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id))")
-	mustExec(t, executor, "CREATE TABLE orders(id INT NOT NULL, customer_id INT, total INT, PRIMARY KEY(id))")
-	mustExec(t, executor, "INSERT INTO customers(id, name) VALUES (1,'Ada'),(2,'Grace'),(3,'Lin')")
-	mustExec(t, executor, "INSERT INTO orders(id, customer_id, total) VALUES (100,1,4250),(101,1,725),(200,2,9999)")
-
-	inner := execQuery(t, executor, "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id=o.customer_id ORDER BY o.id")
+	inner := execQuery(t, executor, txns, "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id=o.customer_id ORDER BY o.id")
 	expectedInner := [][]string{{"Ada", "4250"}, {"Ada", "725"}, {"Grace", "9999"}}
 	if !equalRows(inner.Rows, expectedInner) {
 		t.Fatalf("unexpected INNER JOIN rows: %v", inner.Rows)
 	}
 
-	left := execQuery(t, executor, "SELECT c.id, c.name, o.id AS order_id FROM customers c LEFT JOIN orders o ON c.id=o.customer_id")
+	left := execQuery(t, executor, txns, "SELECT c.id, c.name, o.id AS order_id FROM customers c LEFT JOIN orders o ON c.id=o.customer_id")
 	expectedLeft := [][]string{{"1", "Ada", "100"}, {"1", "Ada", "101"}, {"2", "Grace", "200"}, {"3", "Lin", "NULL"}}
 	if !equalRows(sortedRows(left.Rows, func(a, b []string) bool {
 		if a[0] == b[0] {
@@ -124,13 +82,13 @@ func TestExecutorJoins(t *testing.T) {
 		t.Fatalf("unexpected LEFT JOIN rows: %v", left.Rows)
 	}
 
-	filtered := execQuery(t, executor, "SELECT c.name, o.total FROM customers c LEFT JOIN orders o ON c.id=o.customer_id WHERE o.total > 1000 ORDER BY c.name")
+	filtered := execQuery(t, executor, txns, "SELECT c.name, o.total FROM customers c LEFT JOIN orders o ON c.id=o.customer_id WHERE o.total > 1000 ORDER BY c.name")
 	expectedFiltered := [][]string{{"Ada", "4250"}, {"Grace", "9999"}}
 	if !equalRows(filtered.Rows, expectedFiltered) {
 		t.Fatalf("unexpected filtered rows: %v", filtered.Rows)
 	}
 
-	nonEqui := execQuery(t, executor, "SELECT c.id, o.id FROM customers c JOIN orders o ON c.id < o.customer_id")
+	nonEqui := execQuery(t, executor, txns, "SELECT c.id, o.id FROM customers c JOIN orders o ON c.id < o.customer_id")
 	expectedNonEqui := [][]string{{"1", "200"}}
 	if !equalRows(sortedRows(nonEqui.Rows, func(a, b []string) bool {
 		if a[0] == b[0] {
@@ -145,35 +103,14 @@ func TestExecutorJoins(t *testing.T) {
 func TestExecutorDecimalInsertSelect(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "decimal.gdb")
-	if err := storage.New(path); err != nil {
-		t.Fatalf("storage new: %v", err)
-	}
-	mgr, err := storage.Open(path)
-	if err != nil {
-		t.Fatalf("storage open: %v", err)
-	}
-	defer mgr.Close()
+	executor, txns, cleanup := newExecutor(t, path)
+	defer cleanup()
 
-	cat, err := catalog.Load(mgr)
-	if err != nil {
-		t.Fatalf("catalog load: %v", err)
-	}
-        idx := indexmgr.New(mgr.Path())
-        defer idx.Close()
-        executor := engineexec.New(cat, mgr, idx)
+	mustExec(t, executor, txns, "CREATE TABLE accounts(id INT, balance DECIMAL(10,2) NOT NULL, PRIMARY KEY(id))")
+	mustExec(t, executor, txns, "INSERT INTO accounts(id, balance) VALUES (1, 12.34)")
+	mustExec(t, executor, txns, "INSERT INTO accounts(id, balance) VALUES (2, '56.00')")
 
-	mustExec(t, executor, "CREATE TABLE accounts(id INT, balance DECIMAL(10,2) NOT NULL, PRIMARY KEY(id))")
-	mustExec(t, executor, "INSERT INTO accounts(id, balance) VALUES (1, 12.34)")
-	mustExec(t, executor, "INSERT INTO accounts(id, balance) VALUES (2, '56.00')")
-
-	stmt, err := parser.Parse("SELECT balance FROM accounts ORDER BY id")
-	if err != nil {
-		t.Fatalf("parse select: %v", err)
-	}
-	res, err := executor.Execute(stmt)
-	if err != nil {
-		t.Fatalf("execute select: %v", err)
-	}
+	res := execQuery(t, executor, txns, "SELECT balance FROM accounts ORDER BY id")
 	expected := [][]string{{"12.34"}, {"56.00"}}
 	if !equalRows(res.Rows, expected) {
 		t.Fatalf("unexpected balances: %v", res.Rows)
@@ -183,33 +120,70 @@ func TestExecutorDecimalInsertSelect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse overflow insert: %v", err)
 	}
-	if _, err := executor.Execute(stmt2); err == nil {
+	if _, err := execParsed(t, executor, txns, stmt2); err == nil {
 		t.Fatalf("expected precision error for large DECIMAL insert")
 	}
 }
 
-func mustExec(t *testing.T, executor *engineexec.Executor, sql string) {
+func mustExec(t *testing.T, executor *engineexec.Executor, txns *txn.Manager, sql string) {
 	t.Helper()
 	stmt, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	if _, err := executor.Execute(stmt); err != nil {
+	if _, err := execParsed(t, executor, txns, stmt); err != nil {
 		t.Fatalf("execute %q: %v", sql, err)
 	}
 }
 
-func execQuery(t *testing.T, executor *engineexec.Executor, sql string) *engineexec.Result {
+func execQuery(t *testing.T, executor *engineexec.Executor, txns *txn.Manager, sql string) *engineexec.Result {
 	t.Helper()
 	stmt, err := parser.Parse(sql)
 	if err != nil {
 		t.Fatalf("parse %q: %v", sql, err)
 	}
-	res, err := executor.Execute(stmt)
+	res, err := execParsed(t, executor, txns, stmt)
 	if err != nil {
 		t.Fatalf("execute %q: %v", sql, err)
 	}
 	return res
+}
+
+func execParsed(t *testing.T, executor *engineexec.Executor, txns *txn.Manager, stmt parser.Statement) (*engineexec.Result, error) {
+	tx := txns.Begin()
+	res, err := executor.Execute(tx, stmt)
+	if err != nil {
+		_ = txns.Rollback(tx.ID())
+		return nil, err
+	}
+	if err := txns.Commit(tx.ID()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return res, nil
+}
+
+func newExecutor(t *testing.T, path string) (*engineexec.Executor, *txn.Manager, func()) {
+	t.Helper()
+	if err := storage.New(path); err != nil {
+		t.Fatalf("storage new: %v", err)
+	}
+	mgr, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("storage open: %v", err)
+	}
+	cat, err := catalog.Load(mgr)
+	if err != nil {
+		t.Fatalf("catalog load: %v", err)
+	}
+	idx := indexmgr.New(mgr.Path())
+	locks := txn.NewLockManager(0)
+	executor := engineexec.New(cat, mgr, idx, locks)
+	txns := txn.NewManager(locks)
+	cleanup := func() {
+		idx.Close()
+		mgr.Close()
+	}
+	return executor, txns, cleanup
 }
 
 func equalStrings(a, b []string) bool {
@@ -250,92 +224,64 @@ func sortedRows(rows [][]string, less func(a, b []string) bool) [][]string {
 }
 
 func TestExecutorIndexScan(t *testing.T) {
-        dir := t.TempDir()
-        path := filepath.Join(dir, "index.gdb")
-        if err := storage.New(path); err != nil {
-                t.Fatalf("storage new: %v", err)
-        }
-        mgr, err := storage.Open(path)
-        if err != nil {
-                t.Fatalf("storage open: %v", err)
-        }
-        defer mgr.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index.gdb")
+	executor, txns, cleanup := newExecutor(t, path)
+	defer cleanup()
 
-        cat, err := catalog.Load(mgr)
-        if err != nil {
-                t.Fatalf("catalog load: %v", err)
-        }
-        idx := indexmgr.New(mgr.Path())
-        defer idx.Close()
-        executor := engineexec.New(cat, mgr, idx)
+	mustExec(t, executor, txns, "CREATE TABLE orders(id INT PRIMARY KEY, total INT)")
+	mustExec(t, executor, txns, "INSERT INTO orders VALUES (1, 4250), (2, 725), (3, 9999), (4, 1200)")
+	mustExec(t, executor, txns, "CREATE INDEX idx_total ON orders(total)")
 
-        mustExec(t, executor, "CREATE TABLE orders(id INT PRIMARY KEY, total INT)")
-        mustExec(t, executor, "INSERT INTO orders VALUES (1, 4250), (2, 725), (3, 9999), (4, 1200)")
-        mustExec(t, executor, "CREATE INDEX idx_total ON orders(total)")
+	res := execQuery(t, executor, txns, "SELECT id FROM orders WHERE total > 5000 ORDER BY id")
+	expected := [][]string{{"3"}}
+	if !equalRows(res.Rows, expected) {
+		t.Fatalf("unexpected rows: %v", res.Rows)
+	}
 
-        res := execQuery(t, executor, "SELECT id FROM orders WHERE total > 5000 ORDER BY id")
-        expected := [][]string{{"3"}}
-        if !equalRows(res.Rows, expected) {
-                t.Fatalf("unexpected rows: %v", res.Rows)
-        }
-
-        planStmt, err := parser.Parse("SELECT id FROM orders WHERE total > 5000")
-        if err != nil {
-                t.Fatalf("parse explain: %v", err)
-        }
-        plan, err := executor.Explain(planStmt)
-        if err != nil {
-                t.Fatalf("explain: %v", err)
-        }
-        if !containsIndexScan(plan.Root) {
-                t.Fatalf("expected plan to include IndexScan, got %v", plan.Root)
-        }
+	planStmt, err := parser.Parse("SELECT id FROM orders WHERE total > 5000")
+	if err != nil {
+		t.Fatalf("parse explain: %v", err)
+	}
+	plan, err := executor.Explain(planStmt)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	if !containsIndexScan(plan.Root) {
+		t.Fatalf("expected plan to include IndexScan, got %v", plan.Root)
+	}
 }
 
 func TestExecutorUniqueIndex(t *testing.T) {
-        dir := t.TempDir()
-        path := filepath.Join(dir, "unique.gdb")
-        if err := storage.New(path); err != nil {
-                t.Fatalf("storage new: %v", err)
-        }
-        mgr, err := storage.Open(path)
-        if err != nil {
-                t.Fatalf("storage open: %v", err)
-        }
-        defer mgr.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unique.gdb")
+	executor, txns, cleanup := newExecutor(t, path)
+	defer cleanup()
 
-        cat, err := catalog.Load(mgr)
-        if err != nil {
-                t.Fatalf("catalog load: %v", err)
-        }
-        idx := indexmgr.New(mgr.Path())
-        defer idx.Close()
-        executor := engineexec.New(cat, mgr, idx)
+	mustExec(t, executor, txns, "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(50))")
+	mustExec(t, executor, txns, "INSERT INTO customers VALUES (1,'Ada'),(2,'Grace')")
+	mustExec(t, executor, txns, "CREATE UNIQUE INDEX idx_customer_name ON customers(name)")
 
-        mustExec(t, executor, "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(50))")
-        mustExec(t, executor, "INSERT INTO customers VALUES (1,'Ada'),(2,'Grace')")
-        mustExec(t, executor, "CREATE UNIQUE INDEX idx_customer_name ON customers(name)")
-
-        dupStmt, err := parser.Parse("INSERT INTO customers VALUES (3,'Ada')")
-        if err != nil {
-                t.Fatalf("parse duplicate: %v", err)
-        }
-        if _, err := executor.Execute(dupStmt); err == nil {
-                t.Fatalf("expected unique violation error")
-        }
+	dupStmt, err := parser.Parse("INSERT INTO customers VALUES (3,'Ada')")
+	if err != nil {
+		t.Fatalf("parse duplicate: %v", err)
+	}
+	if _, err := execParsed(t, executor, txns, dupStmt); err == nil {
+		t.Fatalf("expected unique violation error")
+	}
 }
 
 func containsIndexScan(node *engineexec.PlanNode) bool {
-        if node == nil {
-                return false
-        }
-        if node.Name == "IndexScan" {
-                return true
-        }
-        for _, child := range node.Children {
-                if containsIndexScan(child) {
-                        return true
-                }
-        }
-        return false
+	if node == nil {
+		return false
+	}
+	if node.Name == "IndexScan" {
+		return true
+	}
+	for _, child := range node.Children {
+		if containsIndexScan(child) {
+			return true
+		}
+	}
+	return false
 }
