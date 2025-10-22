@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. This repository currently ships Phase 1A of the roadmap.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. This repository currently ships Phase 1A of the roadmap with incremental tooling improvements.
 
 ## Quick start
 
@@ -45,13 +45,40 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
+### Running scripts
+
+You can execute a file containing semicolon-terminated statements. The runner stops at the first error by default, but the `--continue-on-error` flag keeps processing subsequent statements.
+
+```bash
+cd engine
+./granitectl exec -f ./seed.sql demo.gdb
+```
+
+### Exporting results
+
+For quick CSV exports, change the output format when running ad-hoc commands or scripts:
+
+```bash
+cd engine
+./granitectl exec -q "SELECT * FROM people;" --format csv demo.gdb
+```
+
+### Explaining a query
+
+The `explain` verb prints a lightweight operator tree and JSON payload for integration with tooling.
+
+```bash
+cd engine
+./granitectl explain -q "SELECT * FROM people;" demo.gdb
+```
+
 ## Features
 
 * 4 KB slotted pages with a freelist allocator.
 * Heap files for table storage with automatic page chaining.
 * System catalogue capturing table definitions, column metadata, and row counts.
 * Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT *).
-* Command-line client for database lifecycle management and query execution.
+* Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations
 

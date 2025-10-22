@@ -58,6 +58,19 @@ func (db *Database) Execute(sql string) (*exec.Result, error) {
 	return res, nil
 }
 
+// Explain parses the SQL string and returns the executor's plan representation.
+func (db *Database) Explain(sql string) (*exec.Plan, error) {
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := db.executor.Explain(stmt)
+	if err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
 // Tables returns copies of table metadata for inspection.
 func (db *Database) Tables() ([]*catalog.Table, error) {
 	if db.catalog == nil {
