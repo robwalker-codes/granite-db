@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. This repository currently ships Phase 1A of the roadmap with incremental tooling improvements.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 2 introduces two-table joins on top of the Stage 1 expression engine.
 
 ## Quick start
 
@@ -45,45 +45,40 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
-## New in Stage 1
+## New in Stage 2
 
-Stage 1 introduces expression projections in `SELECT` lists with full type
-inference, aliases, and NULL-aware evaluation. A few examples:
-
-```bash
-./granitectl exec -q "SELECT id+1 AS next, UPPER(name) AS uname, COALESCE(nick,name) AS display FROM people ORDER BY id;" demo.gdb
-```
-
-```
-next | uname | display
----- | ----- | -------
-2    | ADA   | Ada
-3    | GRACE | G
-(2 row(s))
-```
+Stage 2 extends the SELECT pipeline with table aliases and two-table joins in
+addition to the Stage 1 expression work. A few examples:
 
 ```bash
-./granitectl exec -q "SELECT 1+2*3 AS a, (1+2)*3 AS b;" demo.gdb
+./granitectl exec -q "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id=o.customer_id ORDER BY o.id;" demo.gdb
 ```
 
 ```
-a | b
-- | -
-7 | 9
-(1 row(s))
+name | total
+---- | -----
+Ada  | 4250
+Ada  |  725
+Grace| 9999
+(3 row(s))
 ```
 
 ```bash
-./granitectl exec -q "SELECT LENGTH(name) FROM people;" demo.gdb
+./granitectl exec -q "SELECT c.id, c.name, o.id AS order_id FROM customers c LEFT JOIN orders o ON c.id=o.customer_id ORDER BY c.id, order_id;" demo.gdb
 ```
 
 ```
-LENGTH(name)
-------------
-3
-5
-(2 row(s))
+id | name  | order_id
+-- | ----- | --------
+1  | Ada   | 100
+1  | Ada   | 101
+2  | Grace | 200
+3  | Lin   | NULL
+(4 row(s))
 ```
+
+Expression projections, arithmetic, and built-in functions from Stage 1 remain
+available and continue to work without modification.
 
 ### Running scripts
 
@@ -117,12 +112,12 @@ cd engine
 * 4 KB slotted pages with a freelist allocator.
 * Heap files for table storage with automatic page chaining.
 * System catalogue capturing table definitions, column metadata, and row counts.
-* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections and filtering).
+* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections, filtering, ordering, and two-table joins).
 * Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations
 
-* Single-table queries only; JOINs, GROUP BY, and subqueries are not yet supported.
+* Joins are limited to left-deep chains of INNER and LEFT joins. No USING, RIGHT/FULL joins, or join reordering.
 * No transactions, WAL, or concurrent access safety.
 * Single database file – no replication or clustering.
 * Constraints beyond `NOT NULL` and `PRIMARY KEY` are not enforced.
@@ -135,15 +130,10 @@ cd engine
 go test ./...
 ```
 
-## Phase 1B roadmap
+## Roadmap
 
-Phase 1B will focus on:
-
-* Extending SELECT to support simple filters and ordering.
-* Adding basic transaction semantics with a write-ahead log.
-* Introducing secondary indexes to accelerate lookups.
-* Improving the CLI with script execution and formatted exports.
-* Enhancing observability with page inspection tools.
+Future work will focus on richer joins, secondary indexes, and transaction
+infrastructure alongside CLI and observability enhancements.
 
 ## Licence
 

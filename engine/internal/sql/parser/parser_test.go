@@ -49,6 +49,10 @@ func TestSelectProjectionParsing(t *testing.T) {
 	if lit, ok := binary.Right.(*parser.LiteralExpr); !ok || lit.Literal.Value != "1" {
 		t.Fatalf("expected numeric literal 1 on right side")
 	}
+	tableRef, ok := selectStmt.From.(*parser.TableName)
+	if !ok || tableRef.Name != "people" {
+		t.Fatalf("expected FROM people, got %T", selectStmt.From)
+	}
 }
 
 func TestSelectFunctionParsing(t *testing.T) {
@@ -71,6 +75,9 @@ func TestSelectFunctionParsing(t *testing.T) {
 	if _, ok := call.Args[0].(*parser.ColumnRef); !ok {
 		t.Fatalf("expected column reference argument to UPPER")
 	}
+	if _, ok := selectStmt.From.(*parser.TableName); !ok {
+		t.Fatalf("expected FROM table")
+	}
 }
 
 func TestSelectCoalesceParsing(t *testing.T) {
@@ -89,6 +96,9 @@ func TestSelectCoalesceParsing(t *testing.T) {
 	}
 	if len(call.Args) != 2 {
 		t.Fatalf("expected two arguments to COALESCE")
+	}
+	if _, ok := selectStmt.From.(*parser.TableName); !ok {
+		t.Fatalf("expected FROM table")
 	}
 }
 
@@ -118,6 +128,9 @@ func TestExpressionPrecedence(t *testing.T) {
 	if add, ok := mult.Left.(*parser.BinaryExpr); !ok || add.Op != parser.BinaryAdd {
 		t.Fatalf("expected parenthesised addition on left-hand side")
 	}
+	if tableRef, ok := selectStmt.From.(*parser.TableName); !ok || tableRef.Name != "dual" {
+		t.Fatalf("expected FROM dual")
+	}
 }
 
 func TestSelectStarMixedExpressionsNotAllowed(t *testing.T) {
@@ -135,10 +148,81 @@ func TestSelectWithoutFrom(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected SelectStmt, got %T", stmt)
 	}
-	if selectStmt.HasTable {
+	if selectStmt.From != nil {
 		t.Fatalf("expected SELECT without FROM to have no table")
 	}
 	if len(selectStmt.Items) != 1 {
 		t.Fatalf("expected single item, got %d", len(selectStmt.Items))
+	}
+}
+
+func TestJoinParsing(t *testing.T) {
+	stmt, err := parser.Parse("SELECT c.name, o.total FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	selectStmt := stmt.(*parser.SelectStmt)
+	join, ok := selectStmt.From.(*parser.JoinExpr)
+	if !ok {
+		t.Fatalf("expected join expression, got %T", selectStmt.From)
+	}
+	left, ok := join.Left.(*parser.TableName)
+	if !ok || left.Name != "customers" || left.Alias != "c" {
+		t.Fatalf("unexpected left table: %+v", join.Left)
+	}
+	right, ok := join.Right.(*parser.TableName)
+	if !ok || right.Name != "orders" || right.Alias != "o" {
+		t.Fatalf("unexpected right table: %+v", join.Right)
+	}
+	if join.Type != parser.JoinTypeInner {
+		t.Fatalf("expected INNER join, got %v", join.Type)
+	}
+	cond, ok := join.Condition.(*parser.BinaryExpr)
+	if !ok || cond.Op != parser.BinaryEqual {
+		t.Fatalf("expected equality condition, got %T", join.Condition)
+	}
+}
+
+func TestLeftJoinParsing(t *testing.T) {
+	stmt, err := parser.Parse("SELECT c.name FROM customers c LEFT JOIN orders o ON c.id = o.customer_id")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	selectStmt := stmt.(*parser.SelectStmt)
+	join, ok := selectStmt.From.(*parser.JoinExpr)
+	if !ok {
+		t.Fatalf("expected join expression, got %T", selectStmt.From)
+	}
+	if join.Type != parser.JoinTypeLeft {
+		t.Fatalf("expected LEFT join, got %v", join.Type)
+	}
+	if _, ok := join.Left.(*parser.TableName); !ok {
+		t.Fatalf("expected left table in join")
+	}
+	if _, ok := join.Right.(*parser.TableName); !ok {
+		t.Fatalf("expected right table in join")
+	}
+}
+
+func TestJoinUsingNotSupported(t *testing.T) {
+	if _, err := parser.Parse("SELECT * FROM a JOIN b USING(id)"); err == nil {
+		t.Fatalf("expected USING to be rejected")
+	}
+}
+
+func TestOrderByQualifiedColumn(t *testing.T) {
+	stmt, err := parser.Parse("SELECT c.id FROM customers c ORDER BY c.id DESC")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	selectStmt := stmt.(*parser.SelectStmt)
+	if selectStmt.OrderBy == nil {
+		t.Fatalf("expected ORDER BY clause")
+	}
+	if selectStmt.OrderBy.Column != "c.id" {
+		t.Fatalf("expected qualified column, got %s", selectStmt.OrderBy.Column)
+	}
+	if !selectStmt.OrderBy.Desc {
+		t.Fatalf("expected DESC ordering")
 	}
 }

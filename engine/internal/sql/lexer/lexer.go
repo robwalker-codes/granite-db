@@ -40,10 +40,10 @@ type Token struct {
 }
 
 var keywords = map[string]TokenType{
-	"CREATE":    Ident,
-	"TABLE":     Ident,
-	"DROP":      Ident,
-	"INSERT":    Ident,
+        "CREATE":    Ident,
+        "TABLE":     Ident,
+        "DROP":      Ident,
+        "INSERT":    Ident,
 	"INTO":      Ident,
 	"VALUES":    Ident,
 	"SELECT":    Ident,
@@ -74,8 +74,14 @@ var keywords = map[string]TokenType{
 	"LOWER":     Ident,
 	"UPPER":     Ident,
 	"LENGTH":    Ident,
-	"COALESCE":  Ident,
-	"DECIMAL":   Ident,
+        "COALESCE":  Ident,
+        "DECIMAL":   Ident,
+        "JOIN":      Ident,
+        "INNER":     Ident,
+        "LEFT":      Ident,
+        "OUTER":     Ident,
+        "ON":        Ident,
+        "USING":     Ident,
 }
 
 // Lexer performs tokenisation over the input SQL string.
