@@ -2,9 +2,9 @@
 
 GraniteDB follows a clean architecture split between the storage engine, the SQL
 front-end, and the command-line tooling. Each layer exposes narrow interfaces so
-that the system stays modular as new features arrive. Stage 4 extends the
-storage and planning layers with reusable B⁺-trees and simple index-aware
-heuristics.
+that the system stays modular as new features arrive. Stage 5 layers foreign key
+metadata and enforcement onto the Stage 4 storage and planning improvements
+while retaining the reusable B⁺-trees and index-aware heuristics.
 
 ## Storage engine
 
@@ -93,3 +93,42 @@ once the index lookup materialises heap rows.
 that it lists indexes next to tables. `EXPLAIN` output now records the chosen
 index name and highlights residual predicates, making it easy to confirm that a
 query uses the intended access path.
+
+## Foreign key enforcement
+
+Foreign keys are stored alongside tables in the catalogue. Each entry records
+the child columns, parent table, parent key order, and the supported referential
+actions. During DML the executor uses this metadata to gate modifications:
+
+```
++----------------------+      +-----------------------------+
+| Child INSERT/UPDATE  |----->| Build key (skip all-NULL)   |
++----------------------+      +-------------+---------------+
+                                     |
+                                     v
+                           +-----------------------------+
+                           | Probe parent unique index   |
+                           |  - Use PK/UNIQUE definition |
+                           |  - Heap scan fallback       |
+                           +-------------+---------------+
+                                     |
+                                     v
+                           +-----------------------------+
+                           | Reject when parent missing  |
+                           +-----------------------------+
+
++----------------------+      +-----------------------------+
+| Parent DELETE/UPDATE |----->| Locate referencing children |
++----------------------+      |  - Prefer child FK index    |
+                                     |  - Heap scan fallback |
+                                     +-------------+---------+
+                                                   |
+                                                   v
+                                       +---------------------+
+                                       | Reject when child   |
+                                       | rows still present  |
+                                       +---------------------+
+```
+
+All checks are immediate and wrapped around the existing heap/index writes, so
+foreign key errors are surfaced before any WAL entries are emitted.

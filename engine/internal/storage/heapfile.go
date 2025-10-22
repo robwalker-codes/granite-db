@@ -95,7 +95,7 @@ func (hf *HeapFile) Scan(fn func(rid RowID, record []byte) error) error {
 func (hf *HeapFile) Fetch(id RowID) ([]byte, error) {
         pageBuf, err := hf.manager.ReadPage(id.Page)
         if err != nil {
-                        return nil, err
+                return nil, err
         }
         page, err := LoadHeapPage(id.Page, pageBuf)
         if err != nil {
@@ -108,6 +108,22 @@ func (hf *HeapFile) Fetch(id RowID) ([]byte, error) {
         clone := make([]byte, len(record))
         copy(clone, record)
         return clone, nil
+}
+
+// Delete removes the record stored at the specified row identifier.
+func (hf *HeapFile) Delete(id RowID) error {
+        pageBuf, err := hf.manager.ReadPage(id.Page)
+        if err != nil {
+                return err
+        }
+        page, err := LoadHeapPage(id.Page, pageBuf)
+        if err != nil {
+                return err
+        }
+        if err := page.Delete(id.Slot); err != nil {
+                return err
+        }
+        return hf.manager.WritePage(id.Page, page.Data())
 }
 
 // Pages returns all page ids used by the heap file.

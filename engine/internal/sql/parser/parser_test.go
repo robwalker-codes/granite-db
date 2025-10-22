@@ -197,6 +197,62 @@ func TestCreateTableInlinePrimaryKey(t *testing.T) {
 	}
 }
 
+func TestCreateTableForeignKeyParsing(t *testing.T) {
+	sql := `CREATE TABLE order_items(
+                id INT PRIMARY KEY,
+                order_id INT REFERENCES orders(id) ON DELETE RESTRICT ON UPDATE NO ACTION,
+                product_id INT,
+                CONSTRAINT fk_items_product FOREIGN KEY(product_id)
+                        REFERENCES products(id)
+                        ON DELETE RESTRICT ON UPDATE RESTRICT
+        );`
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("parse foreign keys: %v", err)
+	}
+	create := stmt.(*parser.CreateTableStmt)
+	if len(create.ForeignKeys) != 2 {
+		t.Fatalf("expected 2 foreign keys, got %d", len(create.ForeignKeys))
+	}
+	inline := create.ForeignKeys[0]
+	if len(inline.Columns) != 1 || inline.Columns[0] != "order_id" {
+		t.Fatalf("unexpected inline child columns: %+v", inline.Columns)
+	}
+	if inline.ReferencedTable != "orders" {
+		t.Fatalf("expected inline referenced table orders, got %s", inline.ReferencedTable)
+	}
+	if len(inline.ReferencedCols) != 1 || inline.ReferencedCols[0] != "id" {
+		t.Fatalf("unexpected inline referenced columns: %+v", inline.ReferencedCols)
+	}
+	if inline.OnDelete != parser.ForeignKeyActionRestrict {
+		t.Fatalf("expected inline ON DELETE RESTRICT, got %v", inline.OnDelete)
+	}
+	if inline.OnUpdate != parser.ForeignKeyActionNoAction {
+		t.Fatalf("expected inline ON UPDATE NO ACTION, got %v", inline.OnUpdate)
+	}
+	named := create.ForeignKeys[1]
+	if named.Name != "fk_items_product" {
+		t.Fatalf("expected named foreign key fk_items_product, got %s", named.Name)
+	}
+	if named.OnDelete != parser.ForeignKeyActionRestrict || named.OnUpdate != parser.ForeignKeyActionRestrict {
+		t.Fatalf("expected named foreign key to default to RESTRICT actions")
+	}
+	if named.ReferencedTable != "products" {
+		t.Fatalf("expected named foreign key to reference products, got %s", named.ReferencedTable)
+	}
+}
+
+func TestCreateTableForeignKeyUnsupportedAction(t *testing.T) {
+	_, err := parser.Parse("CREATE TABLE t(id INT, parent_id INT REFERENCES parents(id) ON DELETE CASCADE)")
+	if err == nil || err.Error() != "referential action CASCADE is not supported (yet)" {
+		t.Fatalf("expected CASCADE rejection, got %v", err)
+	}
+	_, err = parser.Parse("CREATE TABLE t2(id INT, parent_id INT REFERENCES parents(id) ON DELETE SET NULL)")
+	if err == nil || err.Error() != "referential action SET NULL is not supported (yet)" {
+		t.Fatalf("expected SET NULL rejection, got %v", err)
+	}
+}
+
 func TestJoinParsing(t *testing.T) {
 	stmt, err := parser.Parse("SELECT c.name, o.total FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
 	if err != nil {
@@ -338,55 +394,55 @@ func TestParseAggregateFunctions(t *testing.T) {
 }
 
 func TestCreateIndexParsing(t *testing.T) {
-        stmt, err := parser.Parse("CREATE INDEX idx_total ON orders(total);")
-        if err != nil {
-                t.Fatalf("parse: %v", err)
-        }
-        create, ok := stmt.(*parser.CreateIndexStmt)
-        if !ok {
-                t.Fatalf("expected CreateIndexStmt, got %T", stmt)
-        }
-        if create.Name != "idx_total" || create.Table != "orders" {
-                t.Fatalf("unexpected definition: %+v", create)
-        }
-        if create.Unique {
-                t.Fatalf("expected non-unique index")
-        }
-        if len(create.Columns) != 1 || create.Columns[0] != "total" {
-                t.Fatalf("unexpected columns: %+v", create.Columns)
-        }
+	stmt, err := parser.Parse("CREATE INDEX idx_total ON orders(total);")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	create, ok := stmt.(*parser.CreateIndexStmt)
+	if !ok {
+		t.Fatalf("expected CreateIndexStmt, got %T", stmt)
+	}
+	if create.Name != "idx_total" || create.Table != "orders" {
+		t.Fatalf("unexpected definition: %+v", create)
+	}
+	if create.Unique {
+		t.Fatalf("expected non-unique index")
+	}
+	if len(create.Columns) != 1 || create.Columns[0] != "total" {
+		t.Fatalf("unexpected columns: %+v", create.Columns)
+	}
 }
 
 func TestCreateUniqueIndexParsing(t *testing.T) {
-        stmt, err := parser.Parse("CREATE UNIQUE INDEX idx_name ON customers(name);")
-        if err != nil {
-                t.Fatalf("parse: %v", err)
-        }
-        create := stmt.(*parser.CreateIndexStmt)
-        if !create.Unique {
-                t.Fatalf("expected UNIQUE flag")
-        }
-        if create.Table != "customers" {
-                t.Fatalf("unexpected table %s", create.Table)
-        }
+	stmt, err := parser.Parse("CREATE UNIQUE INDEX idx_name ON customers(name);")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	create := stmt.(*parser.CreateIndexStmt)
+	if !create.Unique {
+		t.Fatalf("expected UNIQUE flag")
+	}
+	if create.Table != "customers" {
+		t.Fatalf("unexpected table %s", create.Table)
+	}
 }
 
 func TestDropIndexParsing(t *testing.T) {
-        stmt, err := parser.Parse("DROP INDEX idx_total;")
-        if err != nil {
-                t.Fatalf("parse: %v", err)
-        }
-        drop, ok := stmt.(*parser.DropIndexStmt)
-        if !ok {
-                t.Fatalf("expected DropIndexStmt, got %T", stmt)
-        }
-        if drop.Name != "idx_total" {
-                t.Fatalf("unexpected index %s", drop.Name)
-        }
+	stmt, err := parser.Parse("DROP INDEX idx_total;")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	drop, ok := stmt.(*parser.DropIndexStmt)
+	if !ok {
+		t.Fatalf("expected DropIndexStmt, got %T", stmt)
+	}
+	if drop.Name != "idx_total" {
+		t.Fatalf("unexpected index %s", drop.Name)
+	}
 }
 
 func TestCreateIndexRequiresColumn(t *testing.T) {
-        if _, err := parser.Parse("CREATE INDEX idx ON orders();"); err == nil {
-                t.Fatalf("expected parse error for empty column list")
-        }
+	if _, err := parser.Parse("CREATE INDEX idx ON orders();"); err == nil {
+		t.Fatalf("expected parse error for empty column list")
+	}
 }

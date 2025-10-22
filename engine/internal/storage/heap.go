@@ -129,17 +129,31 @@ func (p *HeapPage) Data() []byte {
 
 // Record retrieves the raw bytes stored at the provided slot position.
 func (p *HeapPage) Record(slot uint16) ([]byte, error) {
-	if slot >= p.hdr.SlotCount {
-		return nil, fmt.Errorf("storage: slot %d out of bounds", slot)
-	}
-	slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-slot)*slotSize
-	length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
-	if length == 0 {
-		return nil, fmt.Errorf("storage: slot %d is empty", slot)
-	}
-	offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
-	if int(offset)+int(length) > len(p.data) {
-		return nil, fmt.Errorf("storage: corrupt slot %d", slot)
-	}
-	return p.data[offset : offset+length], nil
+        if slot >= p.hdr.SlotCount {
+                return nil, fmt.Errorf("storage: slot %d out of bounds", slot)
+        }
+        slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-slot)*slotSize
+        length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
+        if length == 0 {
+                return nil, fmt.Errorf("storage: slot %d is empty", slot)
+        }
+        offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
+        if int(offset)+int(length) > len(p.data) {
+                return nil, fmt.Errorf("storage: corrupt slot %d", slot)
+        }
+        return p.data[offset : offset+length], nil
+}
+
+// Delete marks the provided slot as free.
+func (p *HeapPage) Delete(slot uint16) error {
+        if slot >= p.hdr.SlotCount {
+                return fmt.Errorf("storage: slot %d out of bounds", slot)
+        }
+        slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-slot)*slotSize
+        length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
+        if length == 0 {
+                return fmt.Errorf("storage: slot %d is already empty", slot)
+        }
+        binary.LittleEndian.PutUint16(p.data[slotPos+2:slotPos+4], 0)
+        return nil
 }

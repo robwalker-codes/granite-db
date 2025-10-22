@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 4 introduces secondary indexes and planner heuristics that build upon the Stage 3 grouping, aggregation, and ordering work.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 5 adds immediate foreign key enforcement on top of the Stage 4 secondary indexes, preserving the earlier grouping, aggregation, and ordering work.
 
 ## Quick start
 
@@ -30,6 +30,20 @@ cd engine
 ./granitectl explain -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
 ```
 
+Foreign keys now protect parent/child relationships immediately:
+
+```bash
+cd engine
+./granitectl exec -q "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(50));" demo.gdb
+./granitectl exec -q "CREATE TABLE orders(id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE RESTRICT ON UPDATE RESTRICT);" demo.gdb
+./granitectl exec -q "INSERT INTO customers VALUES (1,'Ada');" demo.gdb
+./granitectl exec -q "INSERT INTO orders VALUES (100,1);" demo.gdb
+./granitectl exec -q "DELETE FROM customers WHERE id=1;" demo.gdb   # foreign key violation on "fk_orders_1": referenced by "orders" ...
+```
+
+The CLI surfaces friendly error messages when constraints are violated, making it easy to spot the offending key values.
+```
+
 Expected output:
 
 ```
@@ -47,11 +61,14 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
-## New in Stage 4
+## New in Stage 5
 
-Stage 4 adds secondary indexes, uniqueness enforcement, and planner heuristics
-that automatically choose useful access paths. Grouping, aggregation, and
-multi-key ordering from Stage 3 remain available. A few examples:
+Stage 5 introduces table and column level foreign keys with immediate
+`RESTRICT`/`NO ACTION` semantics. The executor validates existing data during
+`CREATE TABLE`, checks parent keys on every insert or update, and blocks parent
+updates or deletes while children reference the old key. All previously shipped
+Stage 4 features, including secondary indexes and index-aware planning, remain
+available. A few examples:
 
 ```bash
 ./granitectl exec -q "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spend FROM customers c LEFT JOIN orders o ON c.id=o.customer_id GROUP BY c.name HAVING SUM(o.total) IS NOT NULL ORDER BY spend DESC, c.name ASC;" demo.gdb
@@ -117,6 +134,7 @@ cd engine
 * Fixed-precision `DECIMAL` columns with precision/scale enforcement across inserts and scans.
 * B⁺-tree indexes shared by primary and secondary keys with optional uniqueness enforcement.
 * Cost-free planner heuristics that recognise equality and range predicates and choose index scans automatically.
+* Immediate foreign key enforcement with RESTRICT/NO ACTION behaviour for both column-level and table-level declarations.
 * Write-ahead logging (REDO) with autocommit execution.
 * Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
@@ -125,7 +143,7 @@ cd engine
 * Joins are limited to left-deep chains of INNER and LEFT joins. No USING, RIGHT/FULL joins, or join reordering.
 * No multi-statement transactions or concurrent access safety beyond WAL-based crash recovery.
 * Single database file – no replication or clustering.
-* Constraints beyond `NOT NULL`, `PRIMARY KEY`, and `UNIQUE` indexes are not enforced.
+* Foreign keys currently support only `RESTRICT`/`NO ACTION` referential actions. `CASCADE`, `SET NULL`, `SET DEFAULT`, and deferrable constraints are not yet available.
 * Only literal VALUES clauses are accepted in INSERT statements.
 
 ## Testing
