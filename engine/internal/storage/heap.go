@@ -87,59 +87,59 @@ func (p *HeapPage) SetNextPage(id PageID) {
 
 // Insert appends a new record to the page if space permits.
 func (p *HeapPage) Insert(record []byte) (uint16, error) {
-        required := len(record) + slotSize
-        if required > p.FreeSpace() {
-                return 0, fmt.Errorf("storage: insufficient free space in page %d", p.id)
-        }
-        offset := int(p.hdr.FreeStart)
-        copy(p.data[offset:], record)
-        p.hdr.FreeStart += uint16(len(record))
+	required := len(record) + slotSize
+	if required > p.FreeSpace() {
+		return 0, fmt.Errorf("storage: insufficient free space in page %d", p.id)
+	}
+	offset := int(p.hdr.FreeStart)
+	copy(p.data[offset:], record)
+	p.hdr.FreeStart += uint16(len(record))
 
-        slotPos := int(p.hdr.FreeEnd) - slotSize
-        binary.LittleEndian.PutUint16(p.data[slotPos:slotPos+2], uint16(offset))
-        binary.LittleEndian.PutUint16(p.data[slotPos+2:slotPos+4], uint16(len(record)))
+	slotPos := int(p.hdr.FreeEnd) - slotSize
+	binary.LittleEndian.PutUint16(p.data[slotPos:slotPos+2], uint16(offset))
+	binary.LittleEndian.PutUint16(p.data[slotPos+2:slotPos+4], uint16(len(record)))
 
-        p.hdr.SlotCount++
-        p.hdr.FreeEnd = uint16(slotPos)
-        writeHeapHeader(p.data, p.hdr)
-        return p.hdr.SlotCount - 1, nil
+	p.hdr.SlotCount++
+	p.hdr.FreeEnd = uint16(slotPos)
+	writeHeapHeader(p.data, p.hdr)
+	return p.hdr.SlotCount - 1, nil
 }
 
 // Records iterates over stored rows, invoking fn for each entry.
 func (p *HeapPage) Records(fn func(slot uint16, record []byte) error) error {
-        for i := uint16(0); i < p.hdr.SlotCount; i++ {
-                slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-i)*slotSize
-                length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
-                if length == 0 {
-                        continue
-                }
-                offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
-                rec := p.data[offset : offset+length]
-                if err := fn(p.hdr.SlotCount-1-i, rec); err != nil {
-                        return err
-                }
-        }
-        return nil
+	for i := uint16(0); i < p.hdr.SlotCount; i++ {
+		slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-i)*slotSize
+		length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
+		if length == 0 {
+			continue
+		}
+		offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
+		rec := p.data[offset : offset+length]
+		if err := fn(i, rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Data exposes the underlying buffer for persistence.
 func (p *HeapPage) Data() []byte {
-        return p.data
+	return p.data
 }
 
 // Record retrieves the raw bytes stored at the provided slot position.
 func (p *HeapPage) Record(slot uint16) ([]byte, error) {
-        if slot >= p.hdr.SlotCount {
-                return nil, fmt.Errorf("storage: slot %d out of bounds", slot)
-        }
-        slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-slot)*slotSize
-        length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
-        if length == 0 {
-                return nil, fmt.Errorf("storage: slot %d is empty", slot)
-        }
-        offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
-        if int(offset)+int(length) > len(p.data) {
-                return nil, fmt.Errorf("storage: corrupt slot %d", slot)
-        }
-        return p.data[offset : offset+length], nil
+	if slot >= p.hdr.SlotCount {
+		return nil, fmt.Errorf("storage: slot %d out of bounds", slot)
+	}
+	slotPos := int(p.hdr.FreeEnd) + int(p.hdr.SlotCount-1-slot)*slotSize
+	length := binary.LittleEndian.Uint16(p.data[slotPos+2 : slotPos+4])
+	if length == 0 {
+		return nil, fmt.Errorf("storage: slot %d is empty", slot)
+	}
+	offset := binary.LittleEndian.Uint16(p.data[slotPos : slotPos+2])
+	if int(offset)+int(length) > len(p.data) {
+		return nil, fmt.Errorf("storage: corrupt slot %d", slot)
+	}
+	return p.data[offset : offset+length], nil
 }
