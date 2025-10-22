@@ -22,10 +22,10 @@ cd engine
 
 ```bash
 cd engine
-./granitectl exec demo.gdb -q "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id));"
-./granitectl exec demo.gdb -q "INSERT INTO people(id, name) VALUES (1, 'Ada');"
-./granitectl exec demo.gdb -q "INSERT INTO people(id, name) VALUES (2, 'Grace');"
-./granitectl exec demo.gdb -q "SELECT * FROM people;"
+./granitectl exec -q "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id));" demo.gdb
+./granitectl exec -q "INSERT INTO people(id, name) VALUES (1, 'Ada');" demo.gdb
+./granitectl exec -q "INSERT INTO people(id, name) VALUES (2, 'Grace');" demo.gdb
+./granitectl exec -q "SELECT * FROM people;" demo.gdb
 ```
 
 Expected output:
