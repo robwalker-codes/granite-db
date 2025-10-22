@@ -43,3 +43,40 @@ func TestEndToEndWorkflow(t *testing.T) {
 		t.Fatalf("unexpected second row: %v", res.Rows[1])
 	}
 }
+
+func TestCatalogPersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "persist.gdb")
+	if err := api.Create(path); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db, err := api.Open(path)
+	if err != nil {
+		t.Fatalf("open initial: %v", err)
+	}
+	if _, err := db.Execute("CREATE TABLE people(id INT, name VARCHAR(50))"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close initial: %v", err)
+	}
+
+	reopened, err := api.Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	tables, err := reopened.Tables()
+	if err != nil {
+		t.Fatalf("tables: %v", err)
+	}
+	if len(tables) != 1 {
+		t.Fatalf("expected 1 table, got %d", len(tables))
+	}
+	if tables[0].Name != "people" {
+		t.Fatalf("unexpected table name: %s", tables[0].Name)
+	}
+	if len(tables[0].Columns) != 2 {
+		t.Fatalf("unexpected column count: %d", len(tables[0].Columns))
+	}
+}

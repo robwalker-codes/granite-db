@@ -42,9 +42,10 @@ const headerSize = 8 + 2 + 2 + 4 + 4 + 4
 // Manager coordinates access to the on-disk database file and handles page
 // allocation, deallocation and catalog persistence.
 type Manager struct {
-	mu     sync.Mutex
-	file   *os.File
-	header databaseHeader
+	mu           sync.Mutex
+	file         *os.File
+	header       databaseHeader
+	catalogCache []byte
 }
 
 // New creates a brand-new GraniteDB database file.
@@ -98,6 +99,15 @@ func (m *Manager) loadHeader() error {
 		return err
 	}
 	m.header = *header
+	if m.header.CatalogSize > uint32(PageSize-headerSize) {
+		return fmt.Errorf("storage: catalog too large")
+	}
+	size := int(m.header.CatalogSize)
+	if size == 0 {
+		m.catalogCache = nil
+	} else {
+		m.setCatalogCache(buf[headerSize : headerSize+size])
+	}
 	return nil
 }
 
@@ -149,15 +159,8 @@ func (m *Manager) UpdateCatalog(payload []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	buf := make([]byte, PageSize)
-	writeHeader(buf, &m.header)
-	copy(buf[headerSize:], payload)
-	m.header.CatalogSize = uint32(len(payload))
-	writeHeader(buf, &m.header)
-	if _, err := m.file.WriteAt(buf, 0); err != nil {
-		return err
-	}
-	return nil
+	m.setCatalogCache(payload)
+	return m.flushHeaderLocked(nil)
 }
 
 // ReadPage retrieves the raw bytes for the given page id.
@@ -240,15 +243,36 @@ func (m *Manager) FreePage(id PageID) error {
 }
 
 func (m *Manager) flushHeaderLocked(catalog []byte) error {
+	if catalog == nil {
+		catalog = m.catalogCache
+	} else {
+		m.setCatalogCache(catalog)
+	}
+	if len(catalog) > PageSize-headerSize {
+		return fmt.Errorf("storage: catalog payload exceeds header page capacity")
+	}
+
 	buf := make([]byte, PageSize)
+	m.header.CatalogSize = uint32(len(catalog))
 	writeHeader(buf, &m.header)
-	if catalog != nil {
+	if len(catalog) > 0 {
 		copy(buf[headerSize:], catalog)
-		m.header.CatalogSize = uint32(len(catalog))
-		writeHeader(buf, &m.header)
 	}
 	_, err := m.file.WriteAt(buf, 0)
 	return err
+}
+
+func (m *Manager) setCatalogCache(payload []byte) {
+	if len(payload) == 0 {
+		m.catalogCache = nil
+		return
+	}
+	if cap(m.catalogCache) >= len(payload) {
+		m.catalogCache = m.catalogCache[:len(payload)]
+	} else {
+		m.catalogCache = make([]byte, len(payload))
+	}
+	copy(m.catalogCache, payload)
 }
 
 func readHeader(buf []byte) (*databaseHeader, error) {
