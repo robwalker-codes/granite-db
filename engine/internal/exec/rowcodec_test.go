@@ -14,10 +14,11 @@ func TestRowCodecRoundTrip(t *testing.T) {
 		{Name: "active", Type: catalog.ColumnTypeBoolean},
 		{Name: "joined", Type: catalog.ColumnTypeDate},
 		{Name: "updated", Type: catalog.ColumnTypeTimestamp},
+		{Name: "nick", Type: catalog.ColumnTypeVarChar, Length: 10},
 	}
 	joined := time.Date(2023, 5, 1, 0, 0, 0, 0, time.UTC)
 	updated := time.Date(2023, 5, 1, 12, 30, 0, 0, time.UTC)
-	values := []interface{}{int32(7), "Ada", true, joined, updated}
+	values := []interface{}{int32(7), "Ada", true, joined, updated, nil}
 
 	encoded, err := EncodeRow(columns, values)
 	if err != nil {
@@ -44,5 +45,8 @@ func TestRowCodecRoundTrip(t *testing.T) {
 	}
 	if !decoded[4].(time.Time).Equal(updated.UTC()) {
 		t.Fatalf("timestamp mismatch: got %v want %v", decoded[4], updated)
+	}
+	if decoded[5] != nil {
+		t.Fatalf("expected nil nickname, got %v", decoded[5])
 	}
 }
