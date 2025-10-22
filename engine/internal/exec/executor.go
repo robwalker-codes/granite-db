@@ -2,6 +2,7 @@ package exec
 
 import (
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -85,10 +86,12 @@ func (e *Executor) executeCreateTable(stmt *parser.CreateTableStmt) (*Result, er
 		}
 		seen[strings.ToLower(col.Name)] = struct{}{}
 		cols[i] = catalog.Column{
-			Name:    col.Name,
-			Type:    convertType(col.Type),
-			Length:  col.Length,
-			NotNull: col.NotNull,
+			Name:      col.Name,
+			Type:      convertType(col.Type),
+			Length:    col.Length,
+			Precision: col.Precision,
+			Scale:     col.Scale,
+			NotNull:   col.NotNull,
 		}
 	}
 	table, err := e.catalog.CreateTable(stmt.Name, cols, stmt.PrimaryKey)
@@ -111,16 +114,22 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
 	}
 	columnOrder := make([]int, len(table.Columns))
-	provided := map[string]int{}
-	for idx, name := range stmt.Columns {
-		provided[strings.ToLower(name)] = idx
-	}
-	for i, col := range table.Columns {
-		idx, ok := provided[strings.ToLower(col.Name)]
-		if !ok {
-			return nil, fmt.Errorf("exec: column %s missing from INSERT", col.Name)
+	if len(stmt.Columns) == 0 {
+		for i := range table.Columns {
+			columnOrder[i] = i
 		}
-		columnOrder[i] = idx
+	} else {
+		provided := map[string]int{}
+		for idx, name := range stmt.Columns {
+			provided[strings.ToLower(name)] = idx
+		}
+		for i, col := range table.Columns {
+			idx, ok := provided[strings.ToLower(col.Name)]
+			if !ok {
+				return nil, fmt.Errorf("exec: column %s missing from INSERT", col.Name)
+			}
+			columnOrder[i] = idx
+		}
 	}
 	heap := storage.NewHeapFile(e.storage, table.RootPage)
 	total := 0
@@ -170,7 +179,17 @@ func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
 		return nil, err
 	}
 
-	if err := e.applyOrdering(rows, validated); err != nil {
+	rows, err = e.applyAggregation(rows, validated, evaluator)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err = e.applyHaving(rows, validated, evaluator)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.applyOrdering(rows, validated.OrderBy, evaluator); err != nil {
 		return nil, err
 	}
 
@@ -416,26 +435,389 @@ func (e *Executor) applyFilter(rows [][]interface{}, filter expr.TypedExpr, eval
 	return filtered, nil
 }
 
-func (e *Executor) applyOrdering(rows [][]interface{}, validated *validator.ValidatedSelect) error {
-	if validated.OrderBy == nil {
+func (e *Executor) applyAggregation(rows [][]interface{}, validated *validator.ValidatedSelect, evaluator *valueEvaluator) ([][]interface{}, error) {
+	groupCount := len(validated.Groupings)
+	aggCount := len(validated.Aggregates)
+	if groupCount == 0 && aggCount == 0 {
+		return rows, nil
+	}
+
+	type aggregateGroup struct {
+		values []interface{}
+		states []*aggregateAccumulator
+	}
+
+	makeGroup := func(values []interface{}) *aggregateGroup {
+		states := make([]*aggregateAccumulator, aggCount)
+		for i, def := range validated.Aggregates {
+			states[i] = newAggregateAccumulator(def)
+		}
+		return &aggregateGroup{values: values, states: states}
+	}
+
+	groups := make(map[string]*aggregateGroup)
+	order := make([]string, 0)
+	var globalKey string
+	if groupCount == 0 {
+		globalKey = "__global__"
+		groups[globalKey] = makeGroup(nil)
+		order = append(order, globalKey)
+	}
+
+	for _, row := range rows {
+		var key string
+		var current *aggregateGroup
+		if groupCount == 0 {
+			key = globalKey
+			current = groups[key]
+		} else {
+			evaluator.setRow(row)
+			values := make([]interface{}, groupCount)
+			var builder strings.Builder
+			for idx, grouping := range validated.Groupings {
+				if idx > 0 {
+					builder.WriteString("|")
+				}
+				value, err := evaluator.eval(grouping.Expr)
+				if err != nil {
+					return nil, err
+				}
+				if value.isNull() {
+					values[idx] = nil
+					builder.WriteString("NULL")
+					continue
+				}
+				values[idx] = value.data
+				builder.WriteString(fmt.Sprintf("%T:%v", value.data, value.data))
+			}
+			key = builder.String()
+			var exists bool
+			current, exists = groups[key]
+			if !exists {
+				stored := make([]interface{}, len(values))
+				copy(stored, values)
+				current = makeGroup(stored)
+				groups[key] = current
+				order = append(order, key)
+			}
+		}
+
+		if aggCount == 0 {
+			continue
+		}
+
+		evaluator.setRow(row)
+		for _, state := range current.states {
+			if err := state.update(evaluator); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	result := make([][]interface{}, 0, len(order))
+	for _, key := range order {
+		group := groups[key]
+		row := make([]interface{}, groupCount+aggCount)
+		if groupCount > 0 && len(group.values) > 0 {
+			copy(row, group.values)
+		}
+		for idx, state := range group.states {
+			value, err := state.finalise()
+			if err != nil {
+				return nil, err
+			}
+			row[groupCount+idx] = value
+		}
+		result = append(result, row)
+	}
+	return result, nil
+}
+
+func (e *Executor) applyHaving(rows [][]interface{}, validated *validator.ValidatedSelect, evaluator *valueEvaluator) ([][]interface{}, error) {
+	if validated.Having == nil {
+		return rows, nil
+	}
+	filtered := make([][]interface{}, 0, len(rows))
+	for _, row := range rows {
+		evaluator.setRow(row)
+		value, err := evaluator.eval(validated.Having)
+		if err != nil {
+			return nil, err
+		}
+		truth, err := toTruthValue(value)
+		if err != nil {
+			return nil, err
+		}
+		if truth == truthTrue {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered, nil
+}
+
+func (e *Executor) applyOrdering(rows [][]interface{}, terms []validator.OrderingTerm, evaluator *valueEvaluator) error {
+	if len(terms) == 0 {
 		return nil
 	}
-	idx := validated.OrderBy.ColumnIndex
-	if idx < 0 || idx >= len(validated.Bindings) {
-		return fmt.Errorf("exec: invalid ORDER BY column index %d", idx)
-	}
-	binding := validated.Bindings[idx]
-	column := binding.Column
+	var sortErr error
 	sort.SliceStable(rows, func(i, j int) bool {
-		left := rows[i][idx]
-		right := rows[j][idx]
-		cmp := compareColumn(column, left, right)
-		if validated.OrderBy.Desc {
-			return cmp > 0
+		if sortErr != nil {
+			return false
 		}
-		return cmp < 0
+		left := rows[i]
+		right := rows[j]
+		for _, term := range terms {
+			evaluator.setRow(left)
+			leftVal, err := evaluator.eval(term.Expr)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			evaluator.setRow(right)
+			rightVal, err := evaluator.eval(term.Expr)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			if leftVal.isNull() && rightVal.isNull() {
+				continue
+			}
+			if leftVal.isNull() {
+				return false
+			}
+			if rightVal.isNull() {
+				return true
+			}
+			cmp, err := compareNonNullValues(leftVal, rightVal)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			if cmp == 0 {
+				continue
+			}
+			if term.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
 	})
+	if sortErr != nil {
+		return sortErr
+	}
 	return nil
+}
+
+type aggregateAccumulator struct {
+	def    validator.AggregateDefinition
+	count  int64
+	sum    decimal.Decimal
+	sumSet bool
+	min    typedValue
+	minSet bool
+	max    typedValue
+	maxSet bool
+}
+
+func newAggregateAccumulator(def validator.AggregateDefinition) *aggregateAccumulator {
+	return &aggregateAccumulator{def: def}
+}
+
+func (a *aggregateAccumulator) update(evaluator *valueEvaluator) error {
+	switch a.def.Func {
+	case validator.AggregateCountStar:
+		a.count++
+		return nil
+	case validator.AggregateCount:
+		value, err := evaluator.eval(a.def.Arg)
+		if err != nil {
+			return err
+		}
+		if !value.isNull() {
+			a.count++
+		}
+		return nil
+	case validator.AggregateSum:
+		value, err := evaluator.eval(a.def.Arg)
+		if err != nil {
+			return err
+		}
+		if value.isNull() {
+			return nil
+		}
+		dec, err := toDecimal(value)
+		if err != nil {
+			return err
+		}
+		if !a.sumSet {
+			a.sum = dec
+			a.sumSet = true
+		} else {
+			a.sum = a.sum.Add(dec)
+		}
+		return nil
+	case validator.AggregateAvg:
+		value, err := evaluator.eval(a.def.Arg)
+		if err != nil {
+			return err
+		}
+		if value.isNull() {
+			return nil
+		}
+		dec, err := toDecimal(value)
+		if err != nil {
+			return err
+		}
+		if !a.sumSet {
+			a.sum = dec
+			a.sumSet = true
+		} else {
+			a.sum = a.sum.Add(dec)
+		}
+		a.count++
+		return nil
+	case validator.AggregateMin:
+		value, err := evaluator.eval(a.def.Arg)
+		if err != nil {
+			return err
+		}
+		if value.isNull() {
+			return nil
+		}
+		if !a.minSet {
+			a.min = value
+			a.minSet = true
+			return nil
+		}
+		cmp, err := compareNonNullValues(value, a.min)
+		if err != nil {
+			return err
+		}
+		if cmp < 0 {
+			a.min = value
+		}
+		return nil
+	case validator.AggregateMax:
+		value, err := evaluator.eval(a.def.Arg)
+		if err != nil {
+			return err
+		}
+		if value.isNull() {
+			return nil
+		}
+		if !a.maxSet {
+			a.max = value
+			a.maxSet = true
+			return nil
+		}
+		cmp, err := compareNonNullValues(value, a.max)
+		if err != nil {
+			return err
+		}
+		if cmp > 0 {
+			a.max = value
+		}
+		return nil
+	default:
+		return fmt.Errorf("exec: unsupported aggregate function")
+	}
+}
+
+func (a *aggregateAccumulator) finalise() (interface{}, error) {
+	switch a.def.Func {
+	case validator.AggregateCountStar, validator.AggregateCount:
+		return a.count, nil
+	case validator.AggregateSum:
+		if !a.sumSet {
+			return nil, nil
+		}
+		if a.def.ResultType.Kind == expr.TypeDecimal {
+			return a.sum.Round(int32(a.def.ResultType.Scale)), nil
+		}
+		return a.sum, nil
+	case validator.AggregateAvg:
+		if !a.sumSet || a.count == 0 {
+			return nil, nil
+		}
+		avg := a.sum.Div(decimal.NewFromInt(a.count))
+		if a.def.ResultType.Kind == expr.TypeDecimal {
+			avg = avg.Round(int32(a.def.ResultType.Scale))
+		}
+		return avg, nil
+	case validator.AggregateMin:
+		if !a.minSet {
+			return nil, nil
+		}
+		return a.min.data, nil
+	case validator.AggregateMax:
+		if !a.maxSet {
+			return nil, nil
+		}
+		return a.max.data, nil
+	default:
+		return nil, fmt.Errorf("exec: unsupported aggregate function")
+	}
+}
+
+func compareNonNullValues(left, right typedValue) (int, error) {
+	switch left.typ.Kind {
+	case expr.TypeInt, expr.TypeBigInt:
+		li, err := toInt64(left)
+		if err != nil {
+			return 0, err
+		}
+		ri, err := toInt64(right)
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case li < ri:
+			return -1, nil
+		case li > ri:
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	case expr.TypeDecimal:
+		ld, err := toDecimal(left)
+		if err != nil {
+			return 0, err
+		}
+		rd, err := toDecimal(right)
+		if err != nil {
+			return 0, err
+		}
+		return ld.Cmp(rd), nil
+	case expr.TypeVarChar:
+		ls := left.data.(string)
+		rs := right.data.(string)
+		return strings.Compare(ls, rs), nil
+	case expr.TypeBoolean:
+		lb := left.data.(bool)
+		rb := right.data.(bool)
+		switch {
+		case lb == rb:
+			return 0, nil
+		case !lb && rb:
+			return -1, nil
+		default:
+			return 1, nil
+		}
+	case expr.TypeDate, expr.TypeTimestamp:
+		lt := left.data.(time.Time)
+		rt := right.data.(time.Time)
+		switch {
+		case lt.Before(rt):
+			return -1, nil
+		case lt.After(rt):
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	default:
+		return 0, fmt.Errorf("exec: unsupported comparison for type %v", left.typ.Kind)
+	}
 }
 
 func applyLimit(rows [][]interface{}, clause *parser.LimitClause) [][]interface{} {
@@ -496,15 +878,42 @@ func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
 		current.Children = append(current.Children, limitNode)
 		current = limitNode
 	}
-	if validated.OrderBy != nil {
-		binding := validated.Bindings[validated.OrderBy.ColumnIndex]
-		qualified := binding.Column.Name
-		if binding.TableAlias != "" {
-			qualified = binding.TableAlias + "." + qualified
+	if len(validated.OrderBy) > 0 {
+		terms := make([]map[string]interface{}, len(validated.OrderBy))
+		for i, term := range validated.OrderBy {
+			terms[i] = map[string]interface{}{"expr": term.Text, "desc": term.Desc}
 		}
-		orderNode := &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": qualified, "desc": validated.OrderBy.Desc}}
+		orderNode := &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"terms": terms}}
 		current.Children = append(current.Children, orderNode)
 		current = orderNode
+	}
+	if validated.Having != nil {
+		havingNode := &PlanNode{Name: "Having"}
+		current.Children = append(current.Children, havingNode)
+		current = havingNode
+	}
+	if len(validated.Groupings) > 0 || len(validated.Aggregates) > 0 {
+		detail := make(map[string]interface{})
+		if len(validated.Groupings) > 0 {
+			groups := make([]string, len(validated.Groupings))
+			for i, grouping := range validated.Groupings {
+				groups[i] = grouping.Text
+			}
+			detail["groups"] = groups
+		}
+		if len(validated.Aggregates) > 0 {
+			aggs := make([]string, len(validated.Aggregates))
+			for i, agg := range validated.Aggregates {
+				aggs[i] = agg.Name
+			}
+			detail["aggregates"] = aggs
+		}
+		aggregateNode := &PlanNode{Name: "Aggregate"}
+		if len(detail) > 0 {
+			aggregateNode.Detail = detail
+		}
+		current.Children = append(current.Children, aggregateNode)
+		current = aggregateNode
 	}
 	if validated.Filter != nil {
 		filterNode := &PlanNode{Name: "Filter"}
@@ -571,6 +980,8 @@ func convertType(dt parser.DataType) catalog.ColumnType {
 		return catalog.ColumnTypeInt
 	case parser.DataTypeBigInt:
 		return catalog.ColumnTypeBigInt
+	case parser.DataTypeDecimal:
+		return catalog.ColumnTypeDecimal
 	case parser.DataTypeVarChar:
 		return catalog.ColumnTypeVarChar
 	case parser.DataTypeBoolean:
@@ -643,6 +1054,23 @@ func convertLiteral(lit parser.Literal, col catalog.Column) (interface{}, error)
 			}
 		}
 		return nil, fmt.Errorf("exec: invalid TIMESTAMP literal %s", lit.Value)
+	case catalog.ColumnTypeDecimal:
+		raw := ""
+		switch lit.Kind {
+		case parser.LiteralNumber, parser.LiteralDecimal, parser.LiteralString:
+			raw = lit.Value
+		default:
+			return nil, fmt.Errorf("exec: expected decimal literal for %s", col.Name)
+		}
+		decValue, err := decimal.NewFromString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("exec: invalid DECIMAL literal %s", raw)
+		}
+		normalised, err := validateDecimalValue(decValue, col)
+		if err != nil {
+			return nil, err
+		}
+		return normalised, nil
 	default:
 		return nil, fmt.Errorf("exec: unsupported column type for %s", col.Name)
 	}
@@ -668,6 +1096,9 @@ func formatTypedValue(value typedValue) (string, error) {
 		dec, ok := value.data.(decimal.Decimal)
 		if !ok {
 			return fmt.Sprintf("%v", value.data), nil
+		}
+		if value.typ.Scale > 0 {
+			return dec.StringFixed(int32(value.typ.Scale)), nil
 		}
 		return dec.String(), nil
 	case expr.TypeVarChar:
@@ -751,7 +1182,65 @@ func compareColumn(column catalog.Column, left, right interface{}) int {
 		default:
 			return 0
 		}
+	case catalog.ColumnTypeDecimal:
+		ld := left.(decimal.Decimal)
+		rd := right.(decimal.Decimal)
+		return ld.Cmp(rd)
 	default:
 		return 0
 	}
+}
+
+func validateDecimalValue(value decimal.Decimal, col catalog.Column) (decimal.Decimal, error) {
+	if col.Precision <= 0 {
+		return decimal.Decimal{}, fmt.Errorf("exec: column %s has invalid DECIMAL definition", col.Name)
+	}
+	if col.Scale < 0 || col.Scale > col.Precision {
+		return decimal.Decimal{}, fmt.Errorf("exec: column %s has invalid DECIMAL definition", col.Name)
+	}
+	actualScale := decimalScale(value)
+	if actualScale > col.Scale {
+		return decimal.Decimal{}, fmt.Errorf("exec: value %s exceeds DECIMAL(%d,%d) scale for column %s", value.String(), col.Precision, col.Scale, col.Name)
+	}
+	integerDigits := decimalIntegerDigits(value)
+	maxInteger := col.Precision - col.Scale
+	if integerDigits > maxInteger {
+		return decimal.Decimal{}, fmt.Errorf("exec: value %s exceeds DECIMAL(%d,%d) precision for column %s", value.String(), col.Precision, col.Scale, col.Name)
+	}
+	digits := decimalDigitCount(value)
+	if digits > col.Precision {
+		return decimal.Decimal{}, fmt.Errorf("exec: value %s exceeds DECIMAL(%d,%d) precision for column %s", value.String(), col.Precision, col.Scale, col.Name)
+	}
+	return value, nil
+}
+
+func decimalScale(value decimal.Decimal) int {
+	exp := value.Exponent()
+	if exp >= 0 {
+		return 0
+	}
+	return int(-exp)
+}
+
+func decimalDigitCount(value decimal.Decimal) int {
+	coeff := value.Coefficient()
+	if coeff.Sign() == 0 {
+		return 0
+	}
+	abs := new(big.Int).Abs(coeff)
+	return len(abs.String())
+}
+
+func decimalIntegerDigits(value decimal.Decimal) int {
+	coeff := value.Coefficient()
+	if coeff.Sign() == 0 {
+		return 0
+	}
+	abs := new(big.Int).Abs(coeff)
+	digits := len(abs.String())
+	scale := decimalScale(value)
+	if digits <= scale {
+		return 0
+	}
+	return digits - scale
 }

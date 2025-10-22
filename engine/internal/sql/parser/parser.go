@@ -116,6 +116,12 @@ func (p *Parser) parseCreate() (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
+			if col.PrimaryKey {
+				if primaryKey != "" {
+					return nil, fmt.Errorf("parser: primary key already defined")
+				}
+				primaryKey = col.Name
+			}
 			cols = append(cols, col)
 		}
 
@@ -141,57 +147,101 @@ func (p *Parser) parseColumnDef() (ColumnDef, error) {
 	}
 	p.nextToken()
 
-	colType, length, err := p.parseType()
+	colType, length, precision, scale, err := p.parseType()
 	if err != nil {
 		return ColumnDef{}, err
 	}
 	notNull := false
-	if strings.ToUpper(p.curToken.Literal) == "NOT" {
-		p.nextToken()
-		if strings.ToUpper(p.curToken.Literal) != "NULL" {
-			return ColumnDef{}, fmt.Errorf("parser: expected NULL after NOT")
+	primaryKey := false
+	for {
+		switch strings.ToUpper(p.curToken.Literal) {
+		case "NOT":
+			if notNull {
+				return ColumnDef{}, fmt.Errorf("parser: NOT NULL specified multiple times")
+			}
+			p.nextToken()
+			if strings.ToUpper(p.curToken.Literal) != "NULL" {
+				return ColumnDef{}, fmt.Errorf("parser: expected NULL after NOT")
+			}
+			p.nextToken()
+			notNull = true
+		case "PRIMARY":
+			if primaryKey {
+				return ColumnDef{}, fmt.Errorf("parser: PRIMARY KEY specified multiple times")
+			}
+			p.nextToken()
+			if strings.ToUpper(p.curToken.Literal) != "KEY" {
+				return ColumnDef{}, fmt.Errorf("parser: expected KEY after PRIMARY")
+			}
+			p.nextToken()
+			primaryKey = true
+			notNull = true
+		default:
+			return ColumnDef{Name: name, Type: colType, Length: length, Precision: precision, Scale: scale, NotNull: notNull, PrimaryKey: primaryKey}, nil
 		}
-		p.nextToken()
-		notNull = true
 	}
-	return ColumnDef{Name: name, Type: colType, Length: length, NotNull: notNull}, nil
 }
 
-func (p *Parser) parseType() (DataType, int, error) {
+func (p *Parser) parseType() (DataType, int, int, int, error) {
 	switch strings.ToUpper(p.curToken.Literal) {
 	case "INT":
 		p.nextToken()
-		return DataTypeInt, 0, nil
+		return DataTypeInt, 0, 0, 0, nil
 	case "BIGINT":
 		p.nextToken()
-		return DataTypeBigInt, 0, nil
-	case "BOOLEAN":
-		p.nextToken()
-		return DataTypeBoolean, 0, nil
-	case "DATE":
-		p.nextToken()
-		return DataTypeDate, 0, nil
-	case "TIMESTAMP":
-		p.nextToken()
-		return DataTypeTimestamp, 0, nil
-	case "VARCHAR":
+		return DataTypeBigInt, 0, 0, 0, nil
+	case "DECIMAL", "NUMERIC":
 		p.nextToken()
 		if p.curToken.Type != lexer.LParen {
-			return 0, 0, fmt.Errorf("parser: expected ( after VARCHAR")
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected ( after DECIMAL")
 		}
 		p.nextToken()
 		if p.curToken.Type != lexer.Number {
-			return 0, 0, fmt.Errorf("parser: expected length for VARCHAR")
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected precision for DECIMAL")
+		}
+		precision := parseInt(p.curToken.Literal)
+		p.nextToken()
+		scale := 0
+		if p.curToken.Type == lexer.Comma {
+			p.nextToken()
+			if p.curToken.Type != lexer.Number {
+				return 0, 0, 0, 0, fmt.Errorf("parser: expected scale for DECIMAL")
+			}
+			scale = parseInt(p.curToken.Literal)
+			p.nextToken()
+		}
+		if p.curToken.Type != lexer.RParen {
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected ) after DECIMAL definition")
+		}
+		p.nextToken()
+		return DataTypeDecimal, 0, precision, scale, nil
+	case "BOOLEAN":
+		p.nextToken()
+		return DataTypeBoolean, 0, 0, 0, nil
+	case "DATE":
+		p.nextToken()
+		return DataTypeDate, 0, 0, 0, nil
+	case "TIMESTAMP":
+		p.nextToken()
+		return DataTypeTimestamp, 0, 0, 0, nil
+	case "VARCHAR":
+		p.nextToken()
+		if p.curToken.Type != lexer.LParen {
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected ( after VARCHAR")
+		}
+		p.nextToken()
+		if p.curToken.Type != lexer.Number {
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected length for VARCHAR")
 		}
 		length := p.curToken.Literal
 		p.nextToken()
 		if p.curToken.Type != lexer.RParen {
-			return 0, 0, fmt.Errorf("parser: expected ) after VARCHAR length")
+			return 0, 0, 0, 0, fmt.Errorf("parser: expected ) after VARCHAR length")
 		}
 		p.nextToken()
-		return DataTypeVarChar, parseInt(length), nil
+		return DataTypeVarChar, parseInt(length), 0, 0, nil
 	default:
-		return 0, 0, fmt.Errorf("parser: unknown type %s", p.curToken.Literal)
+		return 0, 0, 0, 0, fmt.Errorf("parser: unknown type %s", p.curToken.Literal)
 	}
 }
 
@@ -230,13 +280,16 @@ func (p *Parser) parseInsert() (Statement, error) {
 	}
 	table := p.curToken.Literal
 	p.nextToken()
-	if p.curToken.Type != lexer.LParen {
-		return nil, fmt.Errorf("parser: expected column list in INSERT")
-	}
-	p.nextToken()
-	columns, err := p.parseIdentifierList()
-	if err != nil {
-		return nil, err
+	var columns []string
+	hasColumns := false
+	if p.curToken.Type == lexer.LParen {
+		hasColumns = true
+		p.nextToken()
+		parsed, err := p.parseIdentifierList()
+		if err != nil {
+			return nil, err
+		}
+		columns = parsed
 	}
 	if err := p.consumeKeyword("VALUES"); err != nil {
 		return nil, err
@@ -251,7 +304,7 @@ func (p *Parser) parseInsert() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		if len(columns) != len(values) {
+		if hasColumns && len(columns) != len(values) {
 			return nil, fmt.Errorf("parser: column count %d does not match value count %d", len(columns), len(values))
 		}
 		rows = append(rows, values)
@@ -293,24 +346,61 @@ func (p *Parser) parseSelect() (Statement, error) {
 		stmt.Where = expr
 	}
 
+	if strings.ToUpper(p.curToken.Literal) == "GROUP" {
+		p.nextToken()
+		if err := p.consumeKeyword("BY"); err != nil {
+			return nil, err
+		}
+		groupExprs := []Expression{}
+		for {
+			expr, err := p.parseExpression(lowestPrecedence)
+			if err != nil {
+				return nil, err
+			}
+			groupExprs = append(groupExprs, expr)
+			if p.curToken.Type != lexer.Comma {
+				break
+			}
+			p.nextToken()
+		}
+		stmt.GroupBy = groupExprs
+	}
+
+	if strings.ToUpper(p.curToken.Literal) == "HAVING" {
+		p.nextToken()
+		having, err := p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Having = having
+	}
+
 	if strings.ToUpper(p.curToken.Literal) == "ORDER" {
 		p.nextToken()
 		if err := p.consumeKeyword("BY"); err != nil {
 			return nil, err
 		}
-		column, err := p.parseOrderByColumn()
-		if err != nil {
-			return nil, err
-		}
-		desc := false
-		switch strings.ToUpper(p.curToken.Literal) {
-		case "ASC":
+		orders := []*OrderByExpr{}
+		for {
+			expr, err := p.parseExpression(lowestPrecedence)
+			if err != nil {
+				return nil, err
+			}
+			desc := false
+			switch strings.ToUpper(p.curToken.Literal) {
+			case "ASC":
+				p.nextToken()
+			case "DESC":
+				desc = true
+				p.nextToken()
+			}
+			orders = append(orders, &OrderByExpr{Expr: expr, Desc: desc})
+			if p.curToken.Type != lexer.Comma {
+				break
+			}
 			p.nextToken()
-		case "DESC":
-			desc = true
-			p.nextToken()
 		}
-		stmt.OrderBy = &OrderByClause{Column: column, Desc: desc}
+		stmt.OrderBy = orders
 	}
 
 	if strings.ToUpper(p.curToken.Literal) == "LIMIT" {
@@ -333,23 +423,6 @@ func (p *Parser) parseSelect() (Statement, error) {
 	}
 
 	return stmt, nil
-}
-
-func (p *Parser) parseOrderByColumn() (string, error) {
-	if p.curToken.Type != lexer.Ident {
-		return "", fmt.Errorf("parser: expected column name after ORDER BY")
-	}
-	column := p.curToken.Literal
-	p.nextToken()
-	if p.curToken.Type == lexer.Dot {
-		p.nextToken()
-		if p.curToken.Type != lexer.Ident {
-			return "", fmt.Errorf("parser: expected column name after . in ORDER BY")
-		}
-		column = column + "." + p.curToken.Literal
-		p.nextToken()
-	}
-	return column, nil
 }
 
 func (p *Parser) parseTableReference() (TableExpr, error) {
@@ -723,11 +796,29 @@ func (p *Parser) parseFunctionCall(name string) (Expression, error) {
 		return nil, fmt.Errorf("parser: expected ( after function name %s", name)
 	}
 	p.nextToken()
-	args := []Expression{}
+
+	fn := &FunctionCallExpr{Name: name}
+	if strings.ToUpper(p.curToken.Literal) == "DISTINCT" {
+		fn.Distinct = true
+		p.nextToken()
+	}
+
+	if p.curToken.Type == lexer.Star {
+		fn.Args = append(fn.Args, &StarExpr{})
+		p.nextToken()
+		if p.curToken.Type != lexer.RParen {
+			return nil, fmt.Errorf("parser: COUNT(*) style arguments cannot combine with others")
+		}
+		p.nextToken()
+		return fn, nil
+	}
+
 	if p.curToken.Type == lexer.RParen {
 		p.nextToken()
-		return &FunctionCallExpr{Name: name, Args: args}, nil
+		return fn, nil
 	}
+
+	args := []Expression{}
 	for {
 		arg, err := p.parseExpression(lowestPrecedence)
 		if err != nil {
@@ -743,8 +834,9 @@ func (p *Parser) parseFunctionCall(name string) (Expression, error) {
 		}
 		break
 	}
+	fn.Args = args
 	p.nextToken()
-	return &FunctionCallExpr{Name: name, Args: args}, nil
+	return fn, nil
 }
 
 func (p *Parser) parseIsNull(left Expression) (Expression, error) {
@@ -841,7 +933,7 @@ func (p *Parser) curPrecedence() int {
 
 func isAliasTerminator(lit string) bool {
 	switch lit {
-	case "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET", "ASC", "DESC", "AND", "OR", "JOIN", "INNER", "LEFT", "OUTER", "ON", "USING":
+	case "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "BY", "LIMIT", "OFFSET", "ASC", "DESC", "AND", "OR", "JOIN", "INNER", "LEFT", "OUTER", "ON", "USING":
 		return true
 	default:
 		return false

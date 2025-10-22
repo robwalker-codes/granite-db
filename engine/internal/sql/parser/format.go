@@ -48,7 +48,13 @@ func formatExpressionWithPrecedence(expr Expression, parent int) string {
 		for i, arg := range e.Args {
 			parts[i] = FormatExpression(arg)
 		}
-		return e.Name + "(" + strings.Join(parts, ", ") + ")"
+		prefix := e.Name + "("
+		if e.Distinct {
+			prefix += "DISTINCT "
+		}
+		return prefix + strings.Join(parts, ", ") + ")"
+	case *StarExpr:
+		return "*"
 	case *IsNullExpr:
 		prec := comparisonPrecedence
 		inner := formatExpressionWithPrecedence(e.Expr, prec)

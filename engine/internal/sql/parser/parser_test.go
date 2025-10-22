@@ -156,6 +156,47 @@ func TestSelectWithoutFrom(t *testing.T) {
 	}
 }
 
+func TestCreateTableDecimalParsing(t *testing.T) {
+	stmt, err := parser.Parse("CREATE TABLE accounts(id INT, balance DECIMAL(12,2) NOT NULL, note VARCHAR(20))")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	create, ok := stmt.(*parser.CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected CreateTableStmt, got %T", stmt)
+	}
+	if len(create.Columns) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(create.Columns))
+	}
+	balance := create.Columns[1]
+	if balance.Type != parser.DataTypeDecimal {
+		t.Fatalf("expected DECIMAL type, got %v", balance.Type)
+	}
+	if balance.Precision != 12 || balance.Scale != 2 {
+		t.Fatalf("unexpected precision/scale: %d/%d", balance.Precision, balance.Scale)
+	}
+	if !balance.NotNull {
+		t.Fatalf("expected DECIMAL column to inherit NOT NULL")
+	}
+}
+
+func TestCreateTableInlinePrimaryKey(t *testing.T) {
+	stmt, err := parser.Parse("CREATE TABLE t(id INT PRIMARY KEY, name VARCHAR(10));")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	create := stmt.(*parser.CreateTableStmt)
+	if create.PrimaryKey != "id" {
+		t.Fatalf("expected primary key id, got %s", create.PrimaryKey)
+	}
+	if len(create.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(create.Columns))
+	}
+	if !create.Columns[0].NotNull {
+		t.Fatalf("expected PRIMARY KEY column to be NOT NULL")
+	}
+}
+
 func TestJoinParsing(t *testing.T) {
 	stmt, err := parser.Parse("SELECT c.name, o.total FROM customers c INNER JOIN orders o ON c.id = o.customer_id")
 	if err != nil {
@@ -216,13 +257,82 @@ func TestOrderByQualifiedColumn(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	selectStmt := stmt.(*parser.SelectStmt)
-	if selectStmt.OrderBy == nil {
-		t.Fatalf("expected ORDER BY clause")
+	if len(selectStmt.OrderBy) != 1 {
+		t.Fatalf("expected single ORDER BY term")
 	}
-	if selectStmt.OrderBy.Column != "c.id" {
-		t.Fatalf("expected qualified column, got %s", selectStmt.OrderBy.Column)
+	term := selectStmt.OrderBy[0]
+	col, ok := term.Expr.(*parser.ColumnRef)
+	if !ok {
+		t.Fatalf("expected column reference in ORDER BY, got %T", term.Expr)
 	}
-	if !selectStmt.OrderBy.Desc {
+	if col.Table != "c" || col.Name != "id" {
+		t.Fatalf("unexpected column reference: %+v", col)
+	}
+	if !term.Desc {
 		t.Fatalf("expected DESC ordering")
+	}
+}
+
+func TestSelectGroupByHavingOrder(t *testing.T) {
+	query := "SELECT customer_id, COUNT(*) AS c FROM orders GROUP BY customer_id HAVING COUNT(*) > 1 ORDER BY c DESC, customer_id ASC"
+	stmt, err := parser.Parse(query)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	selectStmt := stmt.(*parser.SelectStmt)
+	if len(selectStmt.GroupBy) != 1 {
+		t.Fatalf("expected single GROUP BY expression")
+	}
+	if _, ok := selectStmt.GroupBy[0].(*parser.ColumnRef); !ok {
+		t.Fatalf("expected column reference in GROUP BY")
+	}
+	if selectStmt.Having == nil {
+		t.Fatalf("expected HAVING clause to be parsed")
+	}
+	if len(selectStmt.OrderBy) != 2 {
+		t.Fatalf("expected two ORDER BY terms")
+	}
+	if !selectStmt.OrderBy[0].Desc {
+		t.Fatalf("expected first ORDER BY term to be DESC")
+	}
+	if selectStmt.OrderBy[1].Desc {
+		t.Fatalf("expected second ORDER BY term to default to ASC")
+	}
+}
+
+func TestParseAggregateFunctions(t *testing.T) {
+	stmt, err := parser.Parse("SELECT COUNT(*), COUNT(DISTINCT total) FROM orders")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	selectStmt := stmt.(*parser.SelectStmt)
+	if len(selectStmt.Items) != 2 {
+		t.Fatalf("expected two projection items")
+	}
+	first := selectStmt.Items[0].(*parser.SelectExprItem)
+	call, ok := first.Expr.(*parser.FunctionCallExpr)
+	if !ok || call.Name != "COUNT" {
+		t.Fatalf("expected COUNT function for first expression")
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected COUNT(*) to have a single argument")
+	}
+	if _, ok := call.Args[0].(*parser.StarExpr); !ok {
+		t.Fatalf("expected COUNT(*) to include star argument")
+	}
+
+	second := selectStmt.Items[1].(*parser.SelectExprItem)
+	call2, ok := second.Expr.(*parser.FunctionCallExpr)
+	if !ok || call2.Name != "COUNT" {
+		t.Fatalf("expected COUNT function for second expression")
+	}
+	if !call2.Distinct {
+		t.Fatalf("expected DISTINCT flag to be set")
+	}
+	if len(call2.Args) != 1 {
+		t.Fatalf("expected COUNT(DISTINCT ...) to have single argument")
+	}
+	if _, ok := call2.Args[0].(*parser.ColumnRef); !ok {
+		t.Fatalf("expected column reference argument for COUNT(DISTINCT ...)")
 	}
 }

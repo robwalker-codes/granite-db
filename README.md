@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 2 introduces two-table joins on top of the Stage 1 expression engine.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 3 layers grouping, aggregation, and richer ordering on top of the existing join and expression engine.
 
 ## Quick start
 
@@ -45,40 +45,37 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
-## New in Stage 2
+## New in Stage 3
 
-Stage 2 extends the SELECT pipeline with table aliases and two-table joins in
-addition to the Stage 1 expression work. A few examples:
-
-```bash
-./granitectl exec -q "SELECT c.name, o.total FROM customers c JOIN orders o ON c.id=o.customer_id ORDER BY o.id;" demo.gdb
-```
-
-```
-name | total
----- | -----
-Ada  | 4250
-Ada  |  725
-Grace| 9999
-(3 row(s))
-```
+Stage 3 extends the SELECT pipeline with grouping, aggregation, and multi-key
+ordering in addition to the Stage 2 join work. A few examples:
 
 ```bash
-./granitectl exec -q "SELECT c.id, c.name, o.id AS order_id FROM customers c LEFT JOIN orders o ON c.id=o.customer_id ORDER BY c.id, order_id;" demo.gdb
+./granitectl exec -q "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spend FROM customers c LEFT JOIN orders o ON c.id=o.customer_id GROUP BY c.name HAVING SUM(o.total) IS NOT NULL ORDER BY spend DESC, c.name ASC;" demo.gdb
 ```
 
 ```
-id | name  | order_id
--- | ----- | --------
-1  | Ada   | 100
-1  | Ada   | 101
-2  | Grace | 200
-3  | Lin   | NULL
-(4 row(s))
+name | orders | spend
+---- | ------ | -----
+Grace| 2      | 99.99
+Ada  | 2      | 49.75
+(2 row(s))
 ```
 
-Expression projections, arithmetic, and built-in functions from Stage 1 remain
-available and continue to work without modification.
+```bash
+./granitectl exec -q "SELECT customer_id, AVG(total) AS avg_total FROM orders GROUP BY customer_id ORDER BY customer_id;" demo.gdb
+```
+
+```
+customer_id | avg_total
+----------- | ---------
+1           | 24.88
+2           | 99.99
+(2 row(s))
+```
+
+Expression projections, arithmetic, joins, and scalar functions from the
+previous stages remain available and continue to work without modification.
 
 ### Running scripts
 
@@ -112,7 +109,8 @@ cd engine
 * 4 KB slotted pages with a freelist allocator.
 * Heap files for table storage with automatic page chaining.
 * System catalogue capturing table definitions, column metadata, and row counts.
-* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections, filtering, ordering, and two-table joins).
+* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections, filtering, grouping, aggregation, ordering, and joins).
+* Fixed-precision `DECIMAL` columns with precision/scale enforcement across inserts and scans.
 * Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations

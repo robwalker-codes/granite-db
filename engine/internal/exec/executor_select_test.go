@@ -137,6 +137,50 @@ func TestExecutorJoins(t *testing.T) {
 	}
 }
 
+func TestExecutorDecimalInsertSelect(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "decimal.gdb")
+	if err := storage.New(path); err != nil {
+		t.Fatalf("storage new: %v", err)
+	}
+	mgr, err := storage.Open(path)
+	if err != nil {
+		t.Fatalf("storage open: %v", err)
+	}
+	defer mgr.Close()
+
+	cat, err := catalog.Load(mgr)
+	if err != nil {
+		t.Fatalf("catalog load: %v", err)
+	}
+	executor := engineexec.New(cat, mgr)
+
+	mustExec(t, executor, "CREATE TABLE accounts(id INT, balance DECIMAL(10,2) NOT NULL, PRIMARY KEY(id))")
+	mustExec(t, executor, "INSERT INTO accounts(id, balance) VALUES (1, 12.34)")
+	mustExec(t, executor, "INSERT INTO accounts(id, balance) VALUES (2, '56.00')")
+
+	stmt, err := parser.Parse("SELECT balance FROM accounts ORDER BY id")
+	if err != nil {
+		t.Fatalf("parse select: %v", err)
+	}
+	res, err := executor.Execute(stmt)
+	if err != nil {
+		t.Fatalf("execute select: %v", err)
+	}
+	expected := [][]string{{"12.34"}, {"56.00"}}
+	if !equalRows(res.Rows, expected) {
+		t.Fatalf("unexpected balances: %v", res.Rows)
+	}
+
+	stmt2, err := parser.Parse("INSERT INTO accounts(id, balance) VALUES (3, 123456789.12)")
+	if err != nil {
+		t.Fatalf("parse overflow insert: %v", err)
+	}
+	if _, err := executor.Execute(stmt2); err == nil {
+		t.Fatalf("expected precision error for large DECIMAL insert")
+	}
+}
+
 func mustExec(t *testing.T, executor *engineexec.Executor, sql string) {
 	t.Helper()
 	stmt, err := parser.Parse(sql)

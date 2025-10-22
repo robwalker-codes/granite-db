@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/example/granite-db/engine/internal/catalog"
 )
 
@@ -79,6 +81,23 @@ func EncodeRow(columns []catalog.Column, values []interface{}) ([]byte, error) {
 			tmp := make([]byte, 8)
 			binary.LittleEndian.PutUint64(tmp, uint64(nanos))
 			buf = append(buf, tmp...)
+		case catalog.ColumnTypeDecimal:
+			decValue, ok := value.(decimal.Decimal)
+			if !ok {
+				return nil, fmt.Errorf("exec: expected decimal value for column %s", col.Name)
+			}
+			normalised, err := validateDecimalValue(decValue, col)
+			if err != nil {
+				return nil, err
+			}
+			formatted := normalised.StringFixed(int32(col.Scale))
+			if len(formatted) > 0xFFFF {
+				return nil, fmt.Errorf("exec: DECIMAL value for column %s too long", col.Name)
+			}
+			tmp := make([]byte, 2)
+			binary.LittleEndian.PutUint16(tmp, uint16(len(formatted)))
+			buf = append(buf, tmp...)
+			buf = append(buf, []byte(formatted)...)
 		default:
 			return nil, fmt.Errorf("exec: unsupported column type %d", col.Type)
 		}
@@ -146,6 +165,25 @@ func DecodeRow(columns []catalog.Column, data []byte) ([]interface{}, error) {
 			nanos := binary.LittleEndian.Uint64(data[pos : pos+8])
 			pos += 8
 			values[i] = time.Unix(0, int64(nanos)).UTC()
+		case catalog.ColumnTypeDecimal:
+			if pos+2 > len(data) {
+				return nil, fmt.Errorf("exec: truncated record for column %s", col.Name)
+			}
+			length := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			if pos+length > len(data) {
+				return nil, fmt.Errorf("exec: truncated record for column %s", col.Name)
+			}
+			raw := string(data[pos : pos+length])
+			pos += length
+			decValue, err := decimal.NewFromString(raw)
+			if err != nil {
+				return nil, fmt.Errorf("exec: invalid DECIMAL encoding for column %s", col.Name)
+			}
+			if _, err := validateDecimalValue(decValue, col); err != nil {
+				return nil, err
+			}
+			values[i] = decValue
 		default:
 			return nil, fmt.Errorf("exec: unsupported column type %d", col.Type)
 		}
