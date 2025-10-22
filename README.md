@@ -45,6 +45,46 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
+## New in Stage 1
+
+Stage 1 introduces expression projections in `SELECT` lists with full type
+inference, aliases, and NULL-aware evaluation. A few examples:
+
+```bash
+./granitectl exec -q "SELECT id+1 AS next, UPPER(name) AS uname, COALESCE(nick,name) AS display FROM people ORDER BY id;" demo.gdb
+```
+
+```
+next | uname | display
+---- | ----- | -------
+2    | ADA   | Ada
+3    | GRACE | G
+(2 row(s))
+```
+
+```bash
+./granitectl exec -q "SELECT 1+2*3 AS a, (1+2)*3 AS b;" demo.gdb
+```
+
+```
+a | b
+- | -
+7 | 9
+(1 row(s))
+```
+
+```bash
+./granitectl exec -q "SELECT LENGTH(name) FROM people;" demo.gdb
+```
+
+```
+LENGTH(name)
+------------
+3
+5
+(2 row(s))
+```
+
 ### Running scripts
 
 You can execute a file containing semicolon-terminated statements. The runner stops at the first error by default, but the `--continue-on-error` flag keeps processing subsequent statements.
@@ -77,12 +117,12 @@ cd engine
 * 4 KB slotted pages with a freelist allocator.
 * Heap files for table storage with automatic page chaining.
 * System catalogue capturing table definitions, column metadata, and row counts.
-* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT *).
+* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections and filtering).
 * Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations
 
-* No WHERE, ORDER BY, LIMIT, or JOIN support.
+* Single-table queries only; JOINs, GROUP BY, and subqueries are not yet supported.
 * No transactions, WAL, or concurrent access safety.
 * Single database file – no replication or clustering.
 * Constraints beyond `NOT NULL` and `PRIMARY KEY` are not enforced.

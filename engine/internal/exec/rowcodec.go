@@ -13,6 +13,11 @@ func EncodeRow(columns []catalog.Column, values []interface{}) ([]byte, error) {
 	buf := make([]byte, 0, 128)
 	for i, col := range columns {
 		value := values[i]
+		if value == nil {
+			buf = append(buf, 0)
+			continue
+		}
+		buf = append(buf, 1)
 		switch col.Type {
 		case catalog.ColumnTypeInt:
 			v, ok := value.(int32)
@@ -86,6 +91,15 @@ func DecodeRow(columns []catalog.Column, data []byte) ([]interface{}, error) {
 	values := make([]interface{}, len(columns))
 	pos := 0
 	for i, col := range columns {
+		if pos >= len(data) {
+			return nil, fmt.Errorf("exec: truncated record for column %s", col.Name)
+		}
+		flag := data[pos]
+		pos++
+		if flag == 0 {
+			values[i] = nil
+			continue
+		}
 		switch col.Type {
 		case catalog.ColumnTypeInt:
 			if pos+4 > len(data) {

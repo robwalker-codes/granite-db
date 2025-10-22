@@ -45,29 +45,53 @@ func (*DropTableStmt) stmt() {}
 type InsertStmt struct {
 	Table   string
 	Columns []string
-	Values  []Literal
+	Rows    [][]Literal
 }
 
 func (*InsertStmt) stmt() {}
 
-// SelectStmt models SELECT * FROM table with optional clauses.
+// SelectStmt models SELECT queries with optional clauses.
 type SelectStmt struct {
-	Table   string
-	Where   Expression
-	OrderBy *OrderByClause
-	Limit   *LimitClause
+	Table    string
+	HasTable bool
+	Items    []SelectItem
+	Where    Expression
+	OrderBy  *OrderByClause
+	Limit    *LimitClause
 }
 
 func (*SelectStmt) stmt() {}
+
+// SelectItem marks an entry in the SELECT projection list.
+type SelectItem interface {
+	selectItem()
+}
+
+// SelectExprItem describes an expression projection with an optional alias.
+type SelectExprItem struct {
+	Expr  Expression
+	Alias string
+}
+
+func (*SelectExprItem) selectItem() {}
+
+// SelectStarItem represents a SELECT * entry.
+type SelectStarItem struct{}
+
+func (*SelectStarItem) selectItem() {}
 
 // LiteralKind identifies literal types.
 type LiteralKind int
 
 const (
 	LiteralNumber LiteralKind = iota
+	LiteralBigInt
+	LiteralDecimal
 	LiteralString
 	LiteralBoolean
 	LiteralNull
+	LiteralDate
+	LiteralTimestamp
 )
 
 // Literal captures a literal value.
@@ -76,14 +100,15 @@ type Literal struct {
 	Value string
 }
 
-// Expression represents a scalar boolean expression.
+// Expression represents a scalar SQL expression.
 type Expression interface {
 	expr()
 }
 
 // ColumnRef references a column within the current row.
 type ColumnRef struct {
-	Name string
+	Table string
+	Name  string
 }
 
 func (*ColumnRef) expr() {}
@@ -95,50 +120,58 @@ type LiteralExpr struct {
 
 func (*LiteralExpr) expr() {}
 
-// ComparisonOp enumerates comparison operators.
-type ComparisonOp string
+// UnaryOp identifies unary operators.
+type UnaryOp string
 
 const (
-	ComparisonEqual        ComparisonOp = "="
-	ComparisonNotEqual     ComparisonOp = "<>"
-	ComparisonLess         ComparisonOp = "<"
-	ComparisonLessEqual    ComparisonOp = "<="
-	ComparisonGreater      ComparisonOp = ">"
-	ComparisonGreaterEqual ComparisonOp = ">="
+	UnaryPlus  UnaryOp = "+"
+	UnaryMinus UnaryOp = "-"
+	UnaryNot   UnaryOp = "NOT"
 )
 
-// ComparisonExpr compares two expressions.
-type ComparisonExpr struct {
-	Left  Expression
-	Right Expression
-	Op    ComparisonOp
-}
-
-func (*ComparisonExpr) expr() {}
-
-// BooleanOp enumerates logical operators.
-type BooleanOp string
-
-const (
-	BooleanAnd BooleanOp = "AND"
-	BooleanOr  BooleanOp = "OR"
-)
-
-// BooleanExpr combines two expressions with AND/OR.
-type BooleanExpr struct {
-	Left  Expression
-	Right Expression
-	Op    BooleanOp
-}
-
-func (*BooleanExpr) expr() {}
-
-// NotExpr negates the result of its operand.
-type NotExpr struct {
+// UnaryExpr represents a unary operator application.
+type UnaryExpr struct {
+	Op   UnaryOp
 	Expr Expression
 }
 
-func (*NotExpr) expr() {}
+func (*UnaryExpr) expr() {}
+
+// BinaryOp enumerates binary operators.
+type BinaryOp string
+
+const (
+	BinaryAdd          BinaryOp = "+"
+	BinarySubtract     BinaryOp = "-"
+	BinaryMultiply     BinaryOp = "*"
+	BinaryDivide       BinaryOp = "/"
+	BinaryModulo       BinaryOp = "%"
+	BinaryEqual        BinaryOp = "="
+	BinaryNotEqual     BinaryOp = "<>"
+	BinaryLess         BinaryOp = "<"
+	BinaryLessEqual    BinaryOp = "<="
+	BinaryGreater      BinaryOp = ">"
+	BinaryGreaterEqual BinaryOp = ">="
+	BinaryAnd          BinaryOp = "AND"
+	BinaryOr           BinaryOp = "OR"
+)
+
+// BinaryExpr combines two operands with a binary operator.
+type BinaryExpr struct {
+	Left  Expression
+	Right Expression
+	Op    BinaryOp
+}
+
+func (*BinaryExpr) expr() {}
+
+// FunctionCallExpr captures function invocations.
+type FunctionCallExpr struct {
+	Name string
+	Args []Expression
+}
+
+func (*FunctionCallExpr) expr() {}
 
 // IsNullExpr tests whether the operand is NULL, optionally negated.
 type IsNullExpr struct {

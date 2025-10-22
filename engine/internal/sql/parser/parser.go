@@ -244,39 +244,50 @@ func (p *Parser) parseInsert() (Statement, error) {
 	if p.curToken.Type != lexer.LParen {
 		return nil, fmt.Errorf("parser: expected value list in INSERT")
 	}
-	p.nextToken()
-	values, err := p.parseLiteralList()
-	if err != nil {
-		return nil, err
+	rows := make([][]Literal, 0, 1)
+	for {
+		p.nextToken()
+		values, err := p.parseLiteralList()
+		if err != nil {
+			return nil, err
+		}
+		if len(columns) != len(values) {
+			return nil, fmt.Errorf("parser: column count %d does not match value count %d", len(columns), len(values))
+		}
+		rows = append(rows, values)
+		if p.curToken.Type != lexer.Comma {
+			break
+		}
+		p.nextToken()
+		if p.curToken.Type != lexer.LParen {
+			return nil, fmt.Errorf("parser: expected ( to start next VALUES tuple")
+		}
 	}
-	if len(columns) != len(values) {
-		return nil, fmt.Errorf("parser: column count %d does not match value count %d", len(columns), len(values))
-	}
-	return &InsertStmt{Table: table, Columns: columns, Values: values}, nil
+	return &InsertStmt{Table: table, Columns: columns, Rows: rows}, nil
 }
 
 func (p *Parser) parseSelect() (Statement, error) {
 	if err := p.consumeKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	if p.curToken.Type != lexer.Star {
-		return nil, fmt.Errorf("parser: only SELECT * is supported")
-	}
-	p.nextToken()
-	if err := p.consumeKeyword("FROM"); err != nil {
+	items, err := p.parseSelectItems()
+	if err != nil {
 		return nil, err
 	}
-	if p.curToken.Type != lexer.Ident {
-		return nil, fmt.Errorf("parser: expected table name after FROM")
+	stmt := &SelectStmt{Items: items}
+	if strings.ToUpper(p.curToken.Literal) == "FROM" {
+		p.nextToken()
+		if p.curToken.Type != lexer.Ident {
+			return nil, fmt.Errorf("parser: expected table name after FROM")
+		}
+		stmt.Table = p.curToken.Literal
+		stmt.HasTable = true
+		p.nextToken()
 	}
-	name := p.curToken.Literal
-	p.nextToken()
-
-	stmt := &SelectStmt{Table: name}
 
 	if strings.ToUpper(p.curToken.Literal) == "WHERE" {
 		p.nextToken()
-		expr, err := p.parseExpression(0)
+		expr, err := p.parseExpression(lowestPrecedence)
 		if err != nil {
 			return nil, err
 		}
@@ -324,6 +335,43 @@ func (p *Parser) parseSelect() (Statement, error) {
 	}
 
 	return stmt, nil
+}
+
+func (p *Parser) parseSelectItems() ([]SelectItem, error) {
+	if p.curToken.Type == lexer.Star {
+		p.nextToken()
+		if p.curToken.Type == lexer.Comma {
+			return nil, fmt.Errorf("parser: SELECT * cannot be combined with expressions (yet)")
+		}
+		return []SelectItem{&SelectStarItem{}}, nil
+	}
+
+	items := []SelectItem{}
+	for {
+		expr, err := p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		alias := ""
+		switch {
+		case strings.ToUpper(p.curToken.Literal) == "AS":
+			p.nextToken()
+			if p.curToken.Type != lexer.Ident {
+				return nil, fmt.Errorf("parser: expected alias after AS")
+			}
+			alias = p.curToken.Literal
+			p.nextToken()
+		case p.curToken.Type == lexer.Ident && !isAliasTerminator(strings.ToUpper(p.curToken.Literal)):
+			alias = p.curToken.Literal
+			p.nextToken()
+		}
+		items = append(items, &SelectExprItem{Expr: expr, Alias: alias})
+		if p.curToken.Type != lexer.Comma {
+			break
+		}
+		p.nextToken()
+	}
+	return items, nil
 }
 
 func (p *Parser) parseIdentifierList() ([]string, error) {
@@ -375,23 +423,41 @@ func (p *Parser) parseLiteral() (Literal, error) {
 		p.nextToken()
 		return lit, nil
 	case lexer.Number:
-		lit := Literal{Kind: LiteralNumber, Value: p.curToken.Literal}
+		kind := LiteralNumber
+		if strings.Contains(p.curToken.Literal, ".") {
+			kind = LiteralDecimal
+		}
+		lit := Literal{Kind: kind, Value: p.curToken.Literal}
 		p.nextToken()
 		return lit, nil
 	case lexer.Ident:
 		upper := strings.ToUpper(p.curToken.Literal)
-		if upper == "TRUE" || upper == "FALSE" {
+		switch upper {
+		case "TRUE", "FALSE":
 			lit := Literal{Kind: LiteralBoolean, Value: upper}
 			p.nextToken()
 			return lit, nil
-		}
-		if upper == "NULL" {
+		case "NULL":
 			lit := Literal{Kind: LiteralNull, Value: upper}
 			p.nextToken()
 			return lit, nil
+		case "DATE":
+			return p.parseTypedLiteral(LiteralDate)
+		case "TIMESTAMP":
+			return p.parseTypedLiteral(LiteralTimestamp)
 		}
 	}
 	return Literal{}, fmt.Errorf("parser: unsupported literal %s", p.curToken.Literal)
+}
+
+func (p *Parser) parseTypedLiteral(kind LiteralKind) (Literal, error) {
+	p.nextToken()
+	if p.curToken.Type != lexer.String {
+		return Literal{}, fmt.Errorf("parser: expected string literal after type keyword")
+	}
+	lit := Literal{Kind: kind, Value: p.curToken.Literal}
+	p.nextToken()
+	return lit, nil
 }
 
 func (p *Parser) parseExpression(precedence int) (Expression, error) {
@@ -416,24 +482,46 @@ func (p *Parser) parseExpression(precedence int) (Expression, error) {
 			break
 		}
 		switch {
+		case isArithmeticToken(p.curToken.Type):
+			tok := p.curToken
+			op, ok := binaryOpForToken(tok)
+			if !ok {
+				return nil, fmt.Errorf("parser: unexpected operator %s", tok.Literal)
+			}
+			prec := p.curPrecedence()
+			p.nextToken()
+			right, err := p.parseExpression(prec)
+			if err != nil {
+				return nil, err
+			}
+			left = &BinaryExpr{Left: left, Right: right, Op: op}
 		case isComparisonToken(p.curToken.Type):
-			expr, err := p.parseComparison(left)
+			tok := p.curToken
+			op, ok := binaryOpForToken(tok)
+			if !ok {
+				return nil, fmt.Errorf("parser: unexpected comparison operator %s", tok.Literal)
+			}
+			prec := p.curPrecedence()
+			p.nextToken()
+			right, err := p.parseExpression(prec)
 			if err != nil {
 				return nil, err
 			}
-			left = expr
+			left = &BinaryExpr{Left: left, Right: right, Op: op}
 		case strings.ToUpper(p.curToken.Literal) == "AND":
-			expr, err := p.parseBoolean(left, BooleanAnd)
+			p.nextToken()
+			right, err := p.parseExpression(andPrecedence)
 			if err != nil {
 				return nil, err
 			}
-			left = expr
+			left = &BinaryExpr{Left: left, Right: right, Op: BinaryAnd}
 		case strings.ToUpper(p.curToken.Literal) == "OR":
-			expr, err := p.parseBoolean(left, BooleanOr)
+			p.nextToken()
+			right, err := p.parseExpression(orPrecedence)
 			if err != nil {
 				return nil, err
 			}
-			left = expr
+			left = &BinaryExpr{Left: left, Right: right, Op: BinaryOr}
 		default:
 			return left, nil
 		}
@@ -443,8 +531,23 @@ func (p *Parser) parseExpression(precedence int) (Expression, error) {
 
 func (p *Parser) parsePrefix() (Expression, error) {
 	switch p.curToken.Type {
+	case lexer.Plus:
+		p.nextToken()
+		expr, err := p.parseExpression(prefixPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryExpr{Op: UnaryPlus, Expr: expr}, nil
+	case lexer.Minus:
+		p.nextToken()
+		expr, err := p.parseExpression(prefixPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryExpr{Op: UnaryMinus, Expr: expr}, nil
 	case lexer.Ident:
-		upper := strings.ToUpper(p.curToken.Literal)
+		name := p.curToken.Literal
+		upper := strings.ToUpper(name)
 		switch upper {
 		case "TRUE", "FALSE":
 			lit := Literal{Kind: LiteralBoolean, Value: upper}
@@ -460,23 +563,53 @@ func (p *Parser) parsePrefix() (Expression, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &NotExpr{Expr: expr}, nil
-		default:
-			name := p.curToken.Literal
-			p.nextToken()
-			return &ColumnRef{Name: name}, nil
+			return &UnaryExpr{Op: UnaryNot, Expr: expr}, nil
+		case "DATE":
+			lit, err := p.parseTypedLiteral(LiteralDate)
+			if err != nil {
+				return nil, err
+			}
+			return &LiteralExpr{Literal: lit}, nil
+		case "TIMESTAMP":
+			lit, err := p.parseTypedLiteral(LiteralTimestamp)
+			if err != nil {
+				return nil, err
+			}
+			return &LiteralExpr{Literal: lit}, nil
 		}
+		if p.peekToken.Type == lexer.LParen {
+			return p.parseFunctionCall(upper)
+		}
+		table := ""
+		if p.peekToken.Type == lexer.Dot {
+			table = name
+			p.nextToken()
+			if p.curToken.Type != lexer.Dot {
+				return nil, fmt.Errorf("parser: expected . in column reference")
+			}
+			p.nextToken()
+			if p.curToken.Type != lexer.Ident {
+				return nil, fmt.Errorf("parser: expected column name after .")
+			}
+			name = p.curToken.Literal
+		}
+		p.nextToken()
+		return &ColumnRef{Table: table, Name: name}, nil
 	case lexer.String:
 		lit := Literal{Kind: LiteralString, Value: p.curToken.Literal}
 		p.nextToken()
 		return &LiteralExpr{Literal: lit}, nil
 	case lexer.Number:
-		lit := Literal{Kind: LiteralNumber, Value: p.curToken.Literal}
+		kind := LiteralNumber
+		if strings.Contains(p.curToken.Literal, ".") {
+			kind = LiteralDecimal
+		}
+		lit := Literal{Kind: kind, Value: p.curToken.Literal}
 		p.nextToken()
 		return &LiteralExpr{Literal: lit}, nil
 	case lexer.LParen:
 		p.nextToken()
-		expr, err := p.parseExpression(0)
+		expr, err := p.parseExpression(lowestPrecedence)
 		if err != nil {
 			return nil, err
 		}
@@ -490,28 +623,34 @@ func (p *Parser) parsePrefix() (Expression, error) {
 	}
 }
 
-func (p *Parser) parseComparison(left Expression) (Expression, error) {
-	tok := p.curToken
-	op, ok := comparisonOpForToken(tok.Type)
-	if !ok {
-		return nil, fmt.Errorf("parser: unexpected comparison operator %s", tok.Literal)
+func (p *Parser) parseFunctionCall(name string) (Expression, error) {
+	p.nextToken()
+	if p.curToken.Type != lexer.LParen {
+		return nil, fmt.Errorf("parser: expected ( after function name %s", name)
 	}
 	p.nextToken()
-	right, err := p.parseExpression(comparisonPrecedence)
-	if err != nil {
-		return nil, err
+	args := []Expression{}
+	if p.curToken.Type == lexer.RParen {
+		p.nextToken()
+		return &FunctionCallExpr{Name: name, Args: args}, nil
 	}
-	return &ComparisonExpr{Left: left, Right: right, Op: op}, nil
-}
-
-func (p *Parser) parseBoolean(left Expression, op BooleanOp) (Expression, error) {
-	prec := booleanPrecedence(op)
+	for {
+		arg, err := p.parseExpression(lowestPrecedence)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+		if p.curToken.Type == lexer.Comma {
+			p.nextToken()
+			continue
+		}
+		if p.curToken.Type != lexer.RParen {
+			return nil, fmt.Errorf("parser: expected ) to close function %s", name)
+		}
+		break
+	}
 	p.nextToken()
-	right, err := p.parseExpression(prec)
-	if err != nil {
-		return nil, err
-	}
-	return &BooleanExpr{Left: left, Right: right, Op: op}, nil
+	return &FunctionCallExpr{Name: name, Args: args}, nil
 }
 
 func (p *Parser) parseIsNull(left Expression) (Expression, error) {
@@ -539,34 +678,60 @@ func isComparisonToken(tt lexer.TokenType) bool {
 	}
 }
 
-func comparisonOpForToken(tt lexer.TokenType) (ComparisonOp, bool) {
+func isArithmeticToken(tt lexer.TokenType) bool {
 	switch tt {
+	case lexer.Plus, lexer.Minus, lexer.Star, lexer.Slash, lexer.Percent:
+		return true
+	default:
+		return false
+	}
+}
+
+func binaryOpForToken(tok lexer.Token) (BinaryOp, bool) {
+	switch tok.Type {
+	case lexer.Plus:
+		return BinaryAdd, true
+	case lexer.Minus:
+		return BinarySubtract, true
+	case lexer.Star:
+		return BinaryMultiply, true
+	case lexer.Slash:
+		return BinaryDivide, true
+	case lexer.Percent:
+		return BinaryModulo, true
 	case lexer.Equal:
-		return ComparisonEqual, true
+		return BinaryEqual, true
 	case lexer.NotEqual:
-		return ComparisonNotEqual, true
+		return BinaryNotEqual, true
 	case lexer.Less:
-		return ComparisonLess, true
+		return BinaryLess, true
 	case lexer.LessEqual:
-		return ComparisonLessEqual, true
+		return BinaryLessEqual, true
 	case lexer.Greater:
-		return ComparisonGreater, true
+		return BinaryGreater, true
 	case lexer.GreaterEqual:
-		return ComparisonGreaterEqual, true
+		return BinaryGreaterEqual, true
 	default:
 		return "", false
 	}
 }
 
 const (
-	comparisonPrecedence = 4
-	andPrecedence        = 3
-	orPrecedence         = 2
-	prefixPrecedence     = 5
+	lowestPrecedence         = 0
+	orPrecedence             = 1
+	andPrecedence            = 2
+	comparisonPrecedence     = 3
+	additivePrecedence       = 4
+	multiplicativePrecedence = 5
+	prefixPrecedence         = 6
 )
 
 func (p *Parser) curPrecedence() int {
 	switch {
+	case p.curToken.Type == lexer.Plus || p.curToken.Type == lexer.Minus:
+		return additivePrecedence
+	case p.curToken.Type == lexer.Star || p.curToken.Type == lexer.Slash || p.curToken.Type == lexer.Percent:
+		return multiplicativePrecedence
 	case isComparisonToken(p.curToken.Type):
 		return comparisonPrecedence
 	case strings.ToUpper(p.curToken.Literal) == "AND":
@@ -576,17 +741,15 @@ func (p *Parser) curPrecedence() int {
 	case strings.ToUpper(p.curToken.Literal) == "IS":
 		return comparisonPrecedence
 	default:
-		return 0
+		return lowestPrecedence
 	}
 }
 
-func booleanPrecedence(op BooleanOp) int {
-	switch op {
-	case BooleanAnd:
-		return andPrecedence
-	case BooleanOr:
-		return orPrecedence
+func isAliasTerminator(lit string) bool {
+	switch lit {
+	case "FROM", "WHERE", "ORDER", "BY", "LIMIT", "OFFSET", "ASC", "DESC", "AND", "OR":
+		return true
 	default:
-		return 0
+		return false
 	}
 }

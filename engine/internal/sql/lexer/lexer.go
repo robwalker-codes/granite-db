@@ -20,6 +20,11 @@ const (
 	RParen
 	Semicolon
 	Star
+	Plus
+	Minus
+	Slash
+	Percent
+	Dot
 	Equal
 	NotEqual
 	Less
@@ -65,6 +70,12 @@ var keywords = map[string]TokenType{
 	"LIMIT":     Ident,
 	"OFFSET":    Ident,
 	"IS":        Ident,
+	"AS":        Ident,
+	"LOWER":     Ident,
+	"UPPER":     Ident,
+	"LENGTH":    Ident,
+	"COALESCE":  Ident,
+	"DECIMAL":   Ident,
 }
 
 // Lexer performs tokenisation over the input SQL string.
@@ -102,6 +113,21 @@ func (l *Lexer) Next() Token {
 	case '*':
 		l.pos++
 		return Token{Type: Star, Literal: "*"}
+	case '+':
+		l.pos++
+		return Token{Type: Plus, Literal: "+"}
+	case '-':
+		l.pos++
+		return Token{Type: Minus, Literal: "-"}
+	case '/':
+		l.pos++
+		return Token{Type: Slash, Literal: "/"}
+	case '%':
+		l.pos++
+		return Token{Type: Percent, Literal: "%"}
+	case '.':
+		l.pos++
+		return Token{Type: Dot, Literal: "."}
 	case '=':
 		l.pos++
 		return Token{Type: Equal, Literal: "="}
@@ -160,8 +186,19 @@ func (l *Lexer) scanIdentifier() Token {
 
 func (l *Lexer) scanNumber() Token {
 	start := l.pos
-	for l.pos < len(l.input) && unicode.IsDigit(l.input[l.pos]) {
-		l.pos++
+	seenDot := false
+	for l.pos < len(l.input) {
+		ch := l.input[l.pos]
+		if unicode.IsDigit(ch) {
+			l.pos++
+			continue
+		}
+		if ch == '.' && !seenDot {
+			seenDot = true
+			l.pos++
+			continue
+		}
+		break
 	}
 	return Token{Type: Number, Literal: string(l.input[start:l.pos])}
 }

@@ -7,8 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/example/granite-db/engine/internal/catalog"
+	"github.com/example/granite-db/engine/internal/sql/expr"
 	"github.com/example/granite-db/engine/internal/sql/parser"
+	"github.com/example/granite-db/engine/internal/sql/validator"
 	"github.com/example/granite-db/engine/internal/storage"
 )
 
@@ -118,119 +122,201 @@ func (e *Executor) executeInsert(stmt *parser.InsertStmt) (*Result, error) {
 		}
 		columnOrder[i] = idx
 	}
-	values := make([]interface{}, len(table.Columns))
-	for i, col := range table.Columns {
-		literal := stmt.Values[columnOrder[i]]
-		value, err := convertLiteral(literal, col)
+	heap := storage.NewHeapFile(e.storage, table.RootPage)
+	total := 0
+	for _, row := range stmt.Rows {
+		if len(row) != len(table.Columns) {
+			return nil, fmt.Errorf("exec: column count %d does not match value count %d", len(table.Columns), len(row))
+		}
+		values := make([]interface{}, len(table.Columns))
+		for i, col := range table.Columns {
+			literal := row[columnOrder[i]]
+			value, err := convertLiteral(literal, col)
+			if err != nil {
+				return nil, err
+			}
+			values[i] = value
+		}
+		encoded, err := EncodeRow(table.Columns, values)
 		if err != nil {
 			return nil, err
 		}
-		values[i] = value
+		if err := heap.Insert(encoded); err != nil {
+			return nil, err
+		}
+		if err := e.catalog.IncrementRowCount(table.Name); err != nil {
+			return nil, err
+		}
+		total++
 	}
-	encoded, err := EncodeRow(table.Columns, values)
-	if err != nil {
-		return nil, err
-	}
-	heap := storage.NewHeapFile(e.storage, table.RootPage)
-	if err := heap.Insert(encoded); err != nil {
-		return nil, err
-	}
-	if err := e.catalog.IncrementRowCount(table.Name); err != nil {
-		return nil, err
-	}
-	return &Result{RowsAffected: 1, Message: "1 row inserted"}, nil
+	message := fmt.Sprintf("%d row(s) inserted", total)
+	return &Result{RowsAffected: total, Message: message}, nil
 }
 
 func (e *Executor) executeSelect(stmt *parser.SelectStmt) (*Result, error) {
-	table, ok := e.catalog.GetTable(stmt.Table)
-	if !ok {
-		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+	var table *catalog.Table
+	if stmt.HasTable {
+		var ok bool
+		table, ok = e.catalog.GetTable(stmt.Table)
+		if !ok {
+			return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+		}
 	}
-	heap := storage.NewHeapFile(e.storage, table.RootPage)
-	ctx := newEvalContext(table.Columns)
-	valuesRows := make([][]interface{}, 0)
-	if err := heap.Scan(func(record []byte) error {
-		values, err := DecodeRow(table.Columns, record)
-		if err != nil {
-			return err
-		}
-		ctx.setValues(values)
-		truth, err := ctx.eval(stmt.Where)
-		if err != nil {
-			return err
-		}
-		if truth != truthTrue {
-			return nil
-		}
-		clone := make([]interface{}, len(values))
-		copy(clone, values)
-		valuesRows = append(valuesRows, clone)
-		return nil
-	}); err != nil {
+	validated, err := validator.ValidateSelect(table, stmt)
+	if err != nil {
 		return nil, err
 	}
-	if stmt.OrderBy != nil {
-		idx, ok := ctx.index[strings.ToLower(stmt.OrderBy.Column)]
-		if !ok {
-			return nil, fmt.Errorf("exec: unknown column %s in ORDER BY", stmt.OrderBy.Column)
+
+	baseRows := make([][]interface{}, 0)
+	evaluator := newValueEvaluator()
+	if table != nil {
+		heap := storage.NewHeapFile(e.storage, table.RootPage)
+		if err := heap.Scan(func(record []byte) error {
+			values, err := DecodeRow(table.Columns, record)
+			if err != nil {
+				return err
+			}
+			evaluator.setRow(values)
+			if validated.Filter != nil {
+				filter, err := evaluator.eval(validated.Filter)
+				if err != nil {
+					return err
+				}
+				truth, err := toTruthValue(filter)
+				if err != nil {
+					return err
+				}
+				if truth != truthTrue {
+					return nil
+				}
+			}
+			clone := make([]interface{}, len(values))
+			copy(clone, values)
+			baseRows = append(baseRows, clone)
+			return nil
+		}); err != nil {
+			return nil, err
 		}
+	} else {
+		evaluator.setRow(nil)
+		include := true
+		if validated.Filter != nil {
+			filter, err := evaluator.eval(validated.Filter)
+			if err != nil {
+				return nil, err
+			}
+			truth, err := toTruthValue(filter)
+			if err != nil {
+				return nil, err
+			}
+			include = truth == truthTrue
+		}
+		if include {
+			baseRows = append(baseRows, nil)
+		}
+	}
+
+	if validated.OrderBy != nil && table != nil {
+		idx := validated.OrderBy.ColumnIndex
 		column := table.Columns[idx]
-		sort.SliceStable(valuesRows, func(i, j int) bool {
-			left := valuesRows[i][idx]
-			right := valuesRows[j][idx]
-			cmp := orderCompare(column, left, right)
-			if stmt.OrderBy.Desc {
+		sort.SliceStable(baseRows, func(i, j int) bool {
+			left := baseRows[i][idx]
+			right := baseRows[j][idx]
+			cmp := compareColumn(column, left, right)
+			if validated.OrderBy.Desc {
 				return cmp > 0
 			}
 			return cmp < 0
 		})
 	}
-	if stmt.Limit != nil {
-		offset := stmt.Limit.Offset
+
+	if validated.Limit != nil {
+		offset := validated.Limit.Offset
 		if offset < 0 {
 			offset = 0
 		}
-		if offset >= len(valuesRows) {
-			valuesRows = [][]interface{}{}
+		if offset >= len(baseRows) {
+			baseRows = [][]interface{}{}
 		} else {
-			valuesRows = valuesRows[offset:]
-			if stmt.Limit.Limit < len(valuesRows) {
-				valuesRows = valuesRows[:stmt.Limit.Limit]
+			baseRows = baseRows[offset:]
+			if validated.Limit.Limit < len(baseRows) {
+				baseRows = baseRows[:validated.Limit.Limit]
 			}
 		}
 	}
-	rows := make([][]string, len(valuesRows))
-	for i, values := range valuesRows {
-		display := make([]string, len(values))
-		for j, v := range values {
-			display[j] = formatValue(table.Columns[j], v)
+
+	projector := newValueEvaluator()
+	rows := make([][]string, len(baseRows))
+	for i, values := range baseRows {
+		projector.setRow(values)
+		display := make([]string, len(validated.Outputs))
+		for j, out := range validated.Outputs {
+			value, err := projector.eval(out.Expr)
+			if err != nil {
+				return nil, err
+			}
+			formatted, err := formatTypedValue(value)
+			if err != nil {
+				return nil, err
+			}
+			display[j] = formatted
 		}
 		rows[i] = display
 	}
-	columns := make([]string, len(table.Columns))
-	for i, col := range table.Columns {
-		columns[i] = col.Name
+
+	columns := make([]string, len(validated.Outputs))
+	for i, out := range validated.Outputs {
+		columns[i] = out.Name
 	}
+
 	return &Result{Columns: columns, Rows: rows, RowsAffected: len(rows), Message: fmt.Sprintf("%d row(s)", len(rows))}, nil
 }
 
 func (e *Executor) explainSelect(stmt *parser.SelectStmt) (*Plan, error) {
-	table, ok := e.catalog.GetTable(stmt.Table)
-	if !ok {
-		return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+	var table *catalog.Table
+	if stmt.HasTable {
+		var ok bool
+		table, ok = e.catalog.GetTable(stmt.Table)
+		if !ok {
+			return nil, fmt.Errorf("exec: table %s not found", stmt.Table)
+		}
 	}
-	detail := map[string]interface{}{"table": table.Name}
-	root := &PlanNode{Name: "SeqScan", Detail: detail}
-	if stmt.Where != nil {
-		root.Children = append(root.Children, &PlanNode{Name: "Filter"})
+	validated, err := validator.ValidateSelect(table, stmt)
+	if err != nil {
+		return nil, err
 	}
-	if stmt.OrderBy != nil {
-		root.Children = append(root.Children, &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": stmt.OrderBy.Column, "desc": stmt.OrderBy.Desc}})
+
+	columnNames := make([]string, len(validated.Outputs))
+	for i, out := range validated.Outputs {
+		columnNames[i] = out.Name
 	}
-	if stmt.Limit != nil {
-		root.Children = append(root.Children, &PlanNode{Name: "Limit", Detail: map[string]interface{}{"limit": stmt.Limit.Limit, "offset": stmt.Limit.Offset}})
+
+	project := &PlanNode{Name: "Project", Detail: map[string]interface{}{"columns": columnNames}}
+	current := project
+
+	if validated.Limit != nil {
+		limitNode := &PlanNode{Name: "Limit", Detail: map[string]interface{}{"limit": validated.Limit.Limit, "offset": validated.Limit.Offset}}
+		current.Children = append(current.Children, limitNode)
+		current = limitNode
 	}
-	return &Plan{Root: root}, nil
+	if validated.OrderBy != nil && table != nil {
+		orderNode := &PlanNode{Name: "OrderBy", Detail: map[string]interface{}{"column": table.Columns[validated.OrderBy.ColumnIndex].Name, "desc": validated.OrderBy.Desc}}
+		current.Children = append(current.Children, orderNode)
+		current = orderNode
+	}
+	if validated.Filter != nil {
+		filterNode := &PlanNode{Name: "Filter"}
+		current.Children = append(current.Children, filterNode)
+		current = filterNode
+	}
+	if table != nil {
+		scan := &PlanNode{Name: "SeqScan", Detail: map[string]interface{}{"table": table.Name}}
+		current.Children = append(current.Children, scan)
+	} else {
+		current.Children = append(current.Children, &PlanNode{Name: "Const"})
+	}
+
+	return &Plan{Root: project}, nil
 }
 
 func convertType(dt parser.DataType) catalog.ColumnType {
@@ -253,6 +339,12 @@ func convertType(dt parser.DataType) catalog.ColumnType {
 }
 
 func convertLiteral(lit parser.Literal, col catalog.Column) (interface{}, error) {
+	if lit.Kind == parser.LiteralNull {
+		if col.NotNull {
+			return nil, fmt.Errorf("exec: column %s does not allow NULL", col.Name)
+		}
+		return nil, nil
+	}
 	switch col.Type {
 	case catalog.ColumnTypeInt:
 		if lit.Kind != parser.LiteralNumber {
@@ -310,27 +402,110 @@ func convertLiteral(lit parser.Literal, col catalog.Column) (interface{}, error)
 	}
 }
 
-func formatValue(col catalog.Column, value interface{}) string {
-	if value == nil {
-		return "NULL"
+func formatTypedValue(value typedValue) (string, error) {
+	if value.isNull() {
+		return "NULL", nil
 	}
-	switch col.Type {
-	case catalog.ColumnTypeInt:
-		return fmt.Sprintf("%d", value.(int32))
-	case catalog.ColumnTypeBigInt:
-		return fmt.Sprintf("%d", value.(int64))
-	case catalog.ColumnTypeBoolean:
-		if value.(bool) {
-			return "TRUE"
+	switch value.typ.Kind {
+	case expr.TypeInt:
+		switch v := value.data.(type) {
+		case int32:
+			return fmt.Sprintf("%d", v), nil
+		case int64:
+			return fmt.Sprintf("%d", v), nil
+		default:
+			return fmt.Sprintf("%v", value.data), nil
 		}
-		return "FALSE"
-	case catalog.ColumnTypeVarChar:
-		return value.(string)
-	case catalog.ColumnTypeDate:
-		return value.(time.Time).Format("2006-01-02")
-	case catalog.ColumnTypeTimestamp:
-		return value.(time.Time).Format(time.RFC3339)
+	case expr.TypeBigInt:
+		return fmt.Sprintf("%d", value.data.(int64)), nil
+	case expr.TypeDecimal:
+		dec, ok := value.data.(decimal.Decimal)
+		if !ok {
+			return fmt.Sprintf("%v", value.data), nil
+		}
+		return dec.String(), nil
+	case expr.TypeVarChar:
+		return value.data.(string), nil
+	case expr.TypeBoolean:
+		if value.data.(bool) {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	case expr.TypeDate:
+		return value.data.(time.Time).Format("2006-01-02"), nil
+	case expr.TypeTimestamp:
+		return value.data.(time.Time).Format(time.RFC3339), nil
+	case expr.TypeNull:
+		return "NULL", nil
 	default:
-		return fmt.Sprintf("%v", value)
+		return fmt.Sprintf("%v", value.data), nil
+	}
+}
+
+func compareColumn(column catalog.Column, left, right interface{}) int {
+	if left == nil && right == nil {
+		return 0
+	}
+	if left == nil {
+		return -1
+	}
+	if right == nil {
+		return 1
+	}
+	switch column.Type {
+	case catalog.ColumnTypeInt:
+		l := left.(int32)
+		r := right.(int32)
+		switch {
+		case l < r:
+			return -1
+		case l > r:
+			return 1
+		default:
+			return 0
+		}
+	case catalog.ColumnTypeBigInt:
+		l := left.(int64)
+		r := right.(int64)
+		switch {
+		case l < r:
+			return -1
+		case l > r:
+			return 1
+		default:
+			return 0
+		}
+	case catalog.ColumnTypeBoolean:
+		l := 0
+		if left.(bool) {
+			l = 1
+		}
+		r := 0
+		if right.(bool) {
+			r = 1
+		}
+		switch {
+		case l < r:
+			return -1
+		case l > r:
+			return 1
+		default:
+			return 0
+		}
+	case catalog.ColumnTypeVarChar:
+		return strings.Compare(left.(string), right.(string))
+	case catalog.ColumnTypeDate, catalog.ColumnTypeTimestamp:
+		lt := left.(time.Time)
+		rt := right.(time.Time)
+		switch {
+		case lt.Before(rt):
+			return -1
+		case lt.After(rt):
+			return 1
+		default:
+			return 0
+		}
+	default:
+		return 0
 	}
 }
