@@ -40,10 +40,27 @@ func (*CreateTableStmt) stmt() {}
 
 // DropTableStmt represents DROP TABLE.
 type DropTableStmt struct {
-	Name string
+        Name string
 }
 
 func (*DropTableStmt) stmt() {}
+
+// CreateIndexStmt models CREATE INDEX statements.
+type CreateIndexStmt struct {
+        Name    string
+        Table   string
+        Columns []string
+        Unique  bool
+}
+
+func (*CreateIndexStmt) stmt() {}
+
+// DropIndexStmt represents DROP INDEX operations.
+type DropIndexStmt struct {
+        Name string
+}
+
+func (*DropIndexStmt) stmt() {}
 
 // InsertStmt represents INSERT INTO.
 type InsertStmt struct {

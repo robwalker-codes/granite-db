@@ -1,9 +1,9 @@
 # SQL support
 
-GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 3
-builds upon the Stage 2 join work by introducing grouping, aggregation, and
-multi-key ordering while retaining the existing expression grammar and join
-pipeline.
+GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 4
+builds upon the Stage 3 grouping, aggregation, and ordering work by adding
+secondary indexes, unique constraints, and planner heuristics while retaining
+the existing expression grammar and join pipeline.
 
 ## Projection expressions
 
@@ -54,6 +54,12 @@ expression. Expressions may reference projection aliases or be re-evaluated in
 place, and `NULL` values are always placed last. `LIMIT ... OFFSET ...` retains
 its existing semantics.
 
+Planner heuristics inspect `WHERE` predicates and try to match equality or
+range conditions to secondary indexes. When a match is found the planner emits
+an index scan operator and records the chosen index in `EXPLAIN` output. Any
+predicates that the index does not cover remain as residual filters evaluated
+by the executor.
+
 ## Grouping and aggregation
 
 `GROUP BY` clauses collect rows into groups using any deterministic expression
@@ -98,7 +104,35 @@ candidates (for example `ambiguous column "id" (candidates: c.id, o.id)`).
 Join planning splits equality predicates into hash join keys wherever possible
 and applies remaining conditions (including non-equality predicates) as
 residual filters. Both INNER and LEFT joins are supported. Multi-way joins are
-evaluated left-to-right without reordering.
+evaluated left-to-right without reordering. Where the right-hand table exposes a
+matching index the planner may apply an index nested loop join to avoid a full
+scan.
+
+## Secondary indexes
+
+Indexes share the B⁺-tree implementation used for primary keys. They are
+declared and removed with:
+
+```
+CREATE [UNIQUE] INDEX index_name ON table_name(column [, column ...]);
+DROP INDEX index_name;
+```
+
+Key columns form a composite lexicographic key. Only ascending order is
+supported and each index name must be unique within its table. Attempting to
+create an index against an unknown table, an unknown column, or an existing
+name raises a descriptive error. Dropping a non-existent index also reports an
+error without modifying the catalogue.
+
+`UNIQUE` indexes reject duplicate key insertions and updates. Violations surface
+as `duplicate key value violates unique index "index_name"`. Values containing
+`NULL` are always considered distinct, following SQL semantics.
+
+All indexes are maintained automatically as rows are inserted, updated, or
+deleted. Heap row identifiers are stored as index payloads, so the executor can
+follow an index lookup with a heap fetch to materialise result rows. `EXPLAIN`
+output includes the chosen index and any remaining predicate fragments so that
+plans are easy to inspect from the CLI.
 
 ## Known limitations
 
@@ -108,4 +142,5 @@ evaluated left-to-right without reordering.
 * Aggregate functions do not support `DISTINCT`, window functions, or grouping
   sets.
 * No user-defined scalar functions beyond the listed built-ins.
+* Index selection is heuristic only and does not yet consider competing costs.
 

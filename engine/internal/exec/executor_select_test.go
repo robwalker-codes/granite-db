@@ -1,14 +1,15 @@
 package exec_test
 
 import (
-	"path/filepath"
-	"sort"
-	"testing"
+        "path/filepath"
+        "sort"
+        "testing"
 
-	"github.com/example/granite-db/engine/internal/catalog"
-	engineexec "github.com/example/granite-db/engine/internal/exec"
-	"github.com/example/granite-db/engine/internal/sql/parser"
-	"github.com/example/granite-db/engine/internal/storage"
+        "github.com/example/granite-db/engine/internal/catalog"
+        engineexec "github.com/example/granite-db/engine/internal/exec"
+        "github.com/example/granite-db/engine/internal/sql/parser"
+        "github.com/example/granite-db/engine/internal/storage"
+        "github.com/example/granite-db/engine/internal/storage/indexmgr"
 )
 
 func TestExecutorSelectExpressions(t *testing.T) {
@@ -28,7 +29,9 @@ func TestExecutorSelectExpressions(t *testing.T) {
 		t.Fatalf("catalog load: %v", err)
 	}
 
-	executor := engineexec.New(cat, mgr)
+        idx := indexmgr.New(mgr.Path())
+        defer idx.Close()
+        executor := engineexec.New(cat, mgr, idx)
 
 	mustExec(t, executor, "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), nick VARCHAR(50))")
 	mustExec(t, executor, "INSERT INTO people(id, name, nick) VALUES (1, 'Ada', NULL)")
@@ -95,7 +98,9 @@ func TestExecutorJoins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("catalog load: %v", err)
 	}
-	executor := engineexec.New(cat, mgr)
+        idx := indexmgr.New(mgr.Path())
+        defer idx.Close()
+        executor := engineexec.New(cat, mgr, idx)
 
 	mustExec(t, executor, "CREATE TABLE customers(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id))")
 	mustExec(t, executor, "CREATE TABLE orders(id INT NOT NULL, customer_id INT, total INT, PRIMARY KEY(id))")
@@ -153,7 +158,9 @@ func TestExecutorDecimalInsertSelect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("catalog load: %v", err)
 	}
-	executor := engineexec.New(cat, mgr)
+        idx := indexmgr.New(mgr.Path())
+        defer idx.Close()
+        executor := engineexec.New(cat, mgr, idx)
 
 	mustExec(t, executor, "CREATE TABLE accounts(id INT, balance DECIMAL(10,2) NOT NULL, PRIMARY KEY(id))")
 	mustExec(t, executor, "INSERT INTO accounts(id, balance) VALUES (1, 12.34)")
@@ -240,4 +247,95 @@ func sortedRows(rows [][]string, less func(a, b []string) bool) [][]string {
 		return less(clone[i], clone[j])
 	})
 	return clone
+}
+
+func TestExecutorIndexScan(t *testing.T) {
+        dir := t.TempDir()
+        path := filepath.Join(dir, "index.gdb")
+        if err := storage.New(path); err != nil {
+                t.Fatalf("storage new: %v", err)
+        }
+        mgr, err := storage.Open(path)
+        if err != nil {
+                t.Fatalf("storage open: %v", err)
+        }
+        defer mgr.Close()
+
+        cat, err := catalog.Load(mgr)
+        if err != nil {
+                t.Fatalf("catalog load: %v", err)
+        }
+        idx := indexmgr.New(mgr.Path())
+        defer idx.Close()
+        executor := engineexec.New(cat, mgr, idx)
+
+        mustExec(t, executor, "CREATE TABLE orders(id INT PRIMARY KEY, total INT)")
+        mustExec(t, executor, "INSERT INTO orders VALUES (1, 4250), (2, 725), (3, 9999), (4, 1200)")
+        mustExec(t, executor, "CREATE INDEX idx_total ON orders(total)")
+
+        res := execQuery(t, executor, "SELECT id FROM orders WHERE total > 5000 ORDER BY id")
+        expected := [][]string{{"3"}}
+        if !equalRows(res.Rows, expected) {
+                t.Fatalf("unexpected rows: %v", res.Rows)
+        }
+
+        planStmt, err := parser.Parse("SELECT id FROM orders WHERE total > 5000")
+        if err != nil {
+                t.Fatalf("parse explain: %v", err)
+        }
+        plan, err := executor.Explain(planStmt)
+        if err != nil {
+                t.Fatalf("explain: %v", err)
+        }
+        if !containsIndexScan(plan.Root) {
+                t.Fatalf("expected plan to include IndexScan, got %v", plan.Root)
+        }
+}
+
+func TestExecutorUniqueIndex(t *testing.T) {
+        dir := t.TempDir()
+        path := filepath.Join(dir, "unique.gdb")
+        if err := storage.New(path); err != nil {
+                t.Fatalf("storage new: %v", err)
+        }
+        mgr, err := storage.Open(path)
+        if err != nil {
+                t.Fatalf("storage open: %v", err)
+        }
+        defer mgr.Close()
+
+        cat, err := catalog.Load(mgr)
+        if err != nil {
+                t.Fatalf("catalog load: %v", err)
+        }
+        idx := indexmgr.New(mgr.Path())
+        defer idx.Close()
+        executor := engineexec.New(cat, mgr, idx)
+
+        mustExec(t, executor, "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(50))")
+        mustExec(t, executor, "INSERT INTO customers VALUES (1,'Ada'),(2,'Grace')")
+        mustExec(t, executor, "CREATE UNIQUE INDEX idx_customer_name ON customers(name)")
+
+        dupStmt, err := parser.Parse("INSERT INTO customers VALUES (3,'Ada')")
+        if err != nil {
+                t.Fatalf("parse duplicate: %v", err)
+        }
+        if _, err := executor.Execute(dupStmt); err == nil {
+                t.Fatalf("expected unique violation error")
+        }
+}
+
+func containsIndexScan(node *engineexec.PlanNode) bool {
+        if node == nil {
+                return false
+        }
+        if node.Name == "IndexScan" {
+                return true
+        }
+        for _, child := range node.Children {
+                if containsIndexScan(child) {
+                        return true
+                }
+        }
+        return false
 }

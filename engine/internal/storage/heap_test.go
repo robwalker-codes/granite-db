@@ -27,7 +27,7 @@ func TestHeapPageInsertAndRecords(t *testing.T) {
 	}
 
 	var idx int
-	if err := page.Records(func(record []byte) error {
+	if err := page.Records(func(slot uint16, record []byte) error {
 		if string(record) != string(records[idx]) {
 			t.Fatalf("record mismatch: got %q want %q", string(record), string(records[idx]))
 		}

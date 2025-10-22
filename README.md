@@ -1,6 +1,6 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 3 layers grouping, aggregation, and richer ordering on top of the existing join and expression engine.
+GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 4 introduces secondary indexes and planner heuristics that build upon the Stage 3 grouping, aggregation, and ordering work.
 
 ## Quick start
 
@@ -26,6 +26,8 @@ cd engine
 ./granitectl exec -q "INSERT INTO people(id, name) VALUES (1, 'Ada');" demo.gdb
 ./granitectl exec -q "INSERT INTO people(id, name) VALUES (2, 'Grace');" demo.gdb
 ./granitectl exec -q "SELECT * FROM people;" demo.gdb
+./granitectl exec -q "CREATE INDEX idx_people_name ON people(name);" demo.gdb
+./granitectl explain -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
 ```
 
 Expected output:
@@ -45,10 +47,11 @@ cd engine
 ./granitectl dump demo.gdb
 ```
 
-## New in Stage 3
+## New in Stage 4
 
-Stage 3 extends the SELECT pipeline with grouping, aggregation, and multi-key
-ordering in addition to the Stage 2 join work. A few examples:
+Stage 4 adds secondary indexes, uniqueness enforcement, and planner heuristics
+that automatically choose useful access paths. Grouping, aggregation, and
+multi-key ordering from Stage 3 remain available. A few examples:
 
 ```bash
 ./granitectl exec -q "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spend FROM customers c LEFT JOIN orders o ON c.id=o.customer_id GROUP BY c.name HAVING SUM(o.total) IS NOT NULL ORDER BY spend DESC, c.name ASC;" demo.gdb
@@ -64,6 +67,7 @@ Ada  | 2      | 49.75
 
 ```bash
 ./granitectl exec -q "SELECT customer_id, AVG(total) AS avg_total FROM orders GROUP BY customer_id ORDER BY customer_id;" demo.gdb
+./granitectl explain -q "SELECT * FROM orders WHERE total > 50;" demo.gdb
 ```
 
 ```
@@ -108,17 +112,20 @@ cd engine
 
 * 4 KB slotted pages with a freelist allocator.
 * Heap files for table storage with automatic page chaining.
-* System catalogue capturing table definitions, column metadata, and row counts.
-* Minimal SQL subset (CREATE TABLE, DROP TABLE, INSERT, SELECT with expression projections, filtering, grouping, aggregation, ordering, and joins).
+* System catalogue capturing table definitions, column metadata, row counts, and secondary indexes.
+* Minimal SQL subset (CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT with expression projections, filtering, grouping, aggregation, ordering, and joins).
 * Fixed-precision `DECIMAL` columns with precision/scale enforcement across inserts and scans.
+* B⁺-tree indexes shared by primary and secondary keys with optional uniqueness enforcement.
+* Cost-free planner heuristics that recognise equality and range predicates and choose index scans automatically.
+* Write-ahead logging (REDO) with autocommit execution.
 * Command-line client for database lifecycle management, query execution, script running, CSV exports, and plan inspection.
 
 ## Current limitations
 
 * Joins are limited to left-deep chains of INNER and LEFT joins. No USING, RIGHT/FULL joins, or join reordering.
-* No transactions, WAL, or concurrent access safety.
+* No multi-statement transactions or concurrent access safety beyond WAL-based crash recovery.
 * Single database file – no replication or clustering.
-* Constraints beyond `NOT NULL` and `PRIMARY KEY` are not enforced.
+* Constraints beyond `NOT NULL`, `PRIMARY KEY`, and `UNIQUE` indexes are not enforced.
 * Only literal VALUES clauses are accepted in INSERT statements.
 
 ## Testing
@@ -130,8 +137,8 @@ go test ./...
 
 ## Roadmap
 
-Future work will focus on richer joins, secondary indexes, and transaction
-infrastructure alongside CLI and observability enhancements.
+Future work will focus on richer join strategies, index cost estimation,
+multi-statement transactions, and observability enhancements.
 
 ## Licence
 

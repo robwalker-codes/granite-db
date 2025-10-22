@@ -69,75 +69,128 @@ func (p *Parser) consumeKeyword(keyword string) error {
 }
 
 func (p *Parser) parseCreate() (Statement, error) {
-	if err := p.consumeKeyword("CREATE"); err != nil {
-		return nil, err
-	}
-	if err := p.consumeKeyword("TABLE"); err != nil {
-		return nil, err
-	}
-	name := p.curToken.Literal
-	if p.curToken.Type != lexer.Ident {
-		return nil, fmt.Errorf("parser: expected table name but found %s", p.curToken.Literal)
-	}
-	p.nextToken()
-	if p.curToken.Type != lexer.LParen {
-		return nil, fmt.Errorf("parser: expected ( after table name")
-	}
-	p.nextToken()
+        if err := p.consumeKeyword("CREATE"); err != nil {
+                return nil, err
+        }
+        unique := false
+        if strings.ToUpper(p.curToken.Literal) == "UNIQUE" {
+                unique = true
+                p.nextToken()
+        }
+        switch strings.ToUpper(p.curToken.Literal) {
+        case "TABLE":
+                if unique {
+                        return nil, fmt.Errorf("parser: UNIQUE not valid before CREATE TABLE")
+                }
+                return p.parseCreateTable()
+        case "INDEX":
+                return p.parseCreateIndex(unique)
+        default:
+                if unique {
+                        return nil, fmt.Errorf("parser: expected INDEX after UNIQUE in CREATE")
+                }
+                return nil, fmt.Errorf("parser: expected TABLE or INDEX after CREATE, found %s", p.curToken.Literal)
+        }
+}
 
-	cols := []ColumnDef{}
-	var primaryKey string
-	for {
-		if strings.ToUpper(p.curToken.Literal) == "PRIMARY" {
-			if primaryKey != "" {
-				return nil, fmt.Errorf("parser: primary key already defined")
-			}
-			if err := p.consumeKeyword("PRIMARY"); err != nil {
-				return nil, err
-			}
-			if err := p.consumeKeyword("KEY"); err != nil {
-				return nil, err
-			}
-			if p.curToken.Type != lexer.LParen {
-				return nil, fmt.Errorf("parser: expected ( after PRIMARY KEY")
-			}
-			p.nextToken()
-			if p.curToken.Type != lexer.Ident {
-				return nil, fmt.Errorf("parser: expected column name in PRIMARY KEY")
-			}
-			primaryKey = p.curToken.Literal
-			p.nextToken()
-			if p.curToken.Type != lexer.RParen {
-				return nil, fmt.Errorf("parser: expected ) after PRIMARY KEY column")
-			}
-			p.nextToken()
-		} else {
-			col, err := p.parseColumnDef()
-			if err != nil {
-				return nil, err
-			}
-			if col.PrimaryKey {
-				if primaryKey != "" {
-					return nil, fmt.Errorf("parser: primary key already defined")
-				}
-				primaryKey = col.Name
-			}
-			cols = append(cols, col)
-		}
+func (p *Parser) parseCreateTable() (Statement, error) {
+        if err := p.consumeKeyword("TABLE"); err != nil {
+                return nil, err
+        }
+        name := p.curToken.Literal
+        if p.curToken.Type != lexer.Ident {
+                return nil, fmt.Errorf("parser: expected table name but found %s", p.curToken.Literal)
+        }
+        p.nextToken()
+        if p.curToken.Type != lexer.LParen {
+                return nil, fmt.Errorf("parser: expected ( after table name")
+        }
+        p.nextToken()
 
-		if p.curToken.Type == lexer.Comma {
-			p.nextToken()
-			continue
-		}
-		break
-	}
+        cols := []ColumnDef{}
+        var primaryKey string
+        for {
+                if strings.ToUpper(p.curToken.Literal) == "PRIMARY" {
+                        if primaryKey != "" {
+                                return nil, fmt.Errorf("parser: primary key already defined")
+                        }
+                        if err := p.consumeKeyword("PRIMARY"); err != nil {
+                                return nil, err
+                        }
+                        if err := p.consumeKeyword("KEY"); err != nil {
+                                return nil, err
+                        }
+                        if p.curToken.Type != lexer.LParen {
+                                return nil, fmt.Errorf("parser: expected ( after PRIMARY KEY")
+                        }
+                        p.nextToken()
+                        if p.curToken.Type != lexer.Ident {
+                                return nil, fmt.Errorf("parser: expected column name in PRIMARY KEY")
+                        }
+                        primaryKey = p.curToken.Literal
+                        p.nextToken()
+                        if p.curToken.Type != lexer.RParen {
+                                return nil, fmt.Errorf("parser: expected ) after PRIMARY KEY column")
+                        }
+                        p.nextToken()
+                } else {
+                        col, err := p.parseColumnDef()
+                        if err != nil {
+                                return nil, err
+                        }
+                        if col.PrimaryKey {
+                                if primaryKey != "" {
+                                        return nil, fmt.Errorf("parser: primary key already defined")
+                                }
+                                primaryKey = col.Name
+                        }
+                        cols = append(cols, col)
+                }
 
-	if p.curToken.Type != lexer.RParen {
-		return nil, fmt.Errorf("parser: expected ) to close column list")
-	}
-	p.nextToken()
+                if p.curToken.Type == lexer.Comma {
+                        p.nextToken()
+                        continue
+                }
+                break
+        }
 
-	return &CreateTableStmt{Name: name, Columns: cols, PrimaryKey: primaryKey}, nil
+        if p.curToken.Type != lexer.RParen {
+                return nil, fmt.Errorf("parser: expected ) to close column list")
+        }
+        p.nextToken()
+
+        return &CreateTableStmt{Name: name, Columns: cols, PrimaryKey: primaryKey}, nil
+}
+
+func (p *Parser) parseCreateIndex(unique bool) (Statement, error) {
+        if err := p.consumeKeyword("INDEX"); err != nil {
+                return nil, err
+        }
+        if p.curToken.Type != lexer.Ident {
+                return nil, fmt.Errorf("parser: expected index name after CREATE INDEX")
+        }
+        name := p.curToken.Literal
+        p.nextToken()
+        if err := p.consumeKeyword("ON"); err != nil {
+                return nil, err
+        }
+        if p.curToken.Type != lexer.Ident {
+                return nil, fmt.Errorf("parser: expected table name after CREATE INDEX")
+        }
+        table := p.curToken.Literal
+        p.nextToken()
+        if p.curToken.Type != lexer.LParen {
+                return nil, fmt.Errorf("parser: expected column list for CREATE INDEX")
+        }
+        p.nextToken()
+        columns, err := p.parseIdentifierList()
+        if err != nil {
+                return nil, err
+        }
+        if len(columns) == 0 {
+                return nil, fmt.Errorf("parser: CREATE INDEX requires at least one column")
+        }
+        return &CreateIndexStmt{Name: name, Table: table, Columns: columns, Unique: unique}, nil
 }
 
 func (p *Parser) parseColumnDef() (ColumnDef, error) {
@@ -254,18 +307,29 @@ func parseInt(value string) int {
 }
 
 func (p *Parser) parseDrop() (Statement, error) {
-	if err := p.consumeKeyword("DROP"); err != nil {
-		return nil, err
-	}
-	if err := p.consumeKeyword("TABLE"); err != nil {
-		return nil, err
-	}
-	if p.curToken.Type != lexer.Ident {
-		return nil, fmt.Errorf("parser: expected table name after DROP TABLE")
-	}
-	name := p.curToken.Literal
-	p.nextToken()
-	return &DropTableStmt{Name: name}, nil
+        if err := p.consumeKeyword("DROP"); err != nil {
+                return nil, err
+        }
+        switch strings.ToUpper(p.curToken.Literal) {
+        case "TABLE":
+                p.nextToken()
+                if p.curToken.Type != lexer.Ident {
+                        return nil, fmt.Errorf("parser: expected table name after DROP TABLE")
+                }
+                name := p.curToken.Literal
+                p.nextToken()
+                return &DropTableStmt{Name: name}, nil
+        case "INDEX":
+                p.nextToken()
+                if p.curToken.Type != lexer.Ident {
+                        return nil, fmt.Errorf("parser: expected index name after DROP INDEX")
+                }
+                name := p.curToken.Literal
+                p.nextToken()
+                return &DropIndexStmt{Name: name}, nil
+        default:
+                return nil, fmt.Errorf("parser: expected TABLE or INDEX after DROP, found %s", p.curToken.Literal)
+        }
 }
 
 func (p *Parser) parseInsert() (Statement, error) {
