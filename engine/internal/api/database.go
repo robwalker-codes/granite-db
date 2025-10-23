@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/example/granite-db/engine/internal/catalog"
 	"github.com/example/granite-db/engine/internal/exec"
@@ -105,6 +107,35 @@ func (db *Database) Execute(sql string) (*exec.Result, error) {
 	default:
 		return db.executeStatement(session, stmt)
 	}
+}
+
+// ExecuteJSON runs the supplied SQL text and serialises the outcome for tooling.
+func (db *Database) ExecuteJSON(sql string) ([]byte, error) {
+	start := time.Now()
+	res, err := db.Execute(sql)
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		Columns      []string   `json:"columns"`
+		Rows         [][]string `json:"rows"`
+		DurationMs   int64      `json:"durationMs"`
+		RowsAffected *int       `json:"rowsAffected,omitempty"`
+		Message      string     `json:"message,omitempty"`
+	}{
+		Columns:    append([]string(nil), res.Columns...),
+		Rows:       cloneRows(res.Rows),
+		DurationMs: time.Since(start).Milliseconds(),
+		Message:    res.Message,
+	}
+	if res.RowsAffected > 0 {
+		value := res.RowsAffected
+		payload.RowsAffected = &value
+	}
+	if payload.Message == "" {
+		payload.Message = "Query executed"
+	}
+	return json.Marshal(payload)
 }
 
 func (db *Database) begin(session int64) (*exec.Result, error) {
@@ -225,6 +256,23 @@ func (db *Database) ExplainJSON(sql string) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+// MetadataJSON captures the schema metadata as a stable JSON payload.
+func (db *Database) MetadataJSON() ([]byte, error) {
+	if db.catalog == nil {
+		return nil, fmt.Errorf("api: database not open")
+	}
+	tables := db.catalog.ListTables()
+	payload := struct {
+		Tables []metadataTable `json:"tables"`
+	}{
+		Tables: make([]metadataTable, len(tables)),
+	}
+	for i, table := range tables {
+		payload.Tables[i] = buildMetadataTable(table)
+	}
+	return json.Marshal(payload)
+}
+
 // Tables returns copies of table metadata for inspection.
 func (db *Database) Tables() ([]*catalog.Table, error) {
 	if db.catalog == nil {
@@ -260,4 +308,136 @@ func currentSessionID() int64 {
 		return 0
 	}
 	return id
+}
+
+func cloneRows(rows [][]string) [][]string {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([][]string, len(rows))
+	for i, row := range rows {
+		copyRow := make([]string, len(row))
+		copy(copyRow, row)
+		out[i] = copyRow
+	}
+	return out
+}
+
+type metadataTable struct {
+	Name     string            `json:"name"`
+	RowCount uint64            `json:"rowCount"`
+	Columns  []metadataColumn  `json:"columns"`
+	Indexes  []metadataIndex   `json:"indexes"`
+	Foreign  []metadataForeign `json:"fks"`
+}
+
+type metadataColumn struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	NotNull bool   `json:"notNull"`
+	Primary bool   `json:"pk"`
+}
+
+type metadataIndex struct {
+	Name    string   `json:"name"`
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"unique"`
+}
+
+type metadataForeign struct {
+	Name       string   `json:"name"`
+	Columns    []string `json:"columns"`
+	RefTable   string   `json:"refTable"`
+	RefColumns []string `json:"refColumns"`
+}
+
+func buildMetadataTable(table *catalog.Table) metadataTable {
+	cols := make([]metadataColumn, len(table.Columns))
+	for i, col := range table.Columns {
+		cols[i] = metadataColumn{
+			Name:    col.Name,
+			Type:    formatColumnType(col),
+			NotNull: col.NotNull,
+			Primary: col.PrimaryKey,
+		}
+	}
+	idx := collectIndexes(table.Indexes)
+	fks := collectForeignKeys(table.ForeignKeys)
+	return metadataTable{
+		Name:     table.Name,
+		RowCount: table.RowCount,
+		Columns:  cols,
+		Indexes:  idx,
+		Foreign:  fks,
+	}
+}
+
+func collectIndexes(indexes map[string]*catalog.Index) []metadataIndex {
+	if len(indexes) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(indexes))
+	for key := range indexes {
+		names = append(names, key)
+	}
+	sort.Strings(names)
+	result := make([]metadataIndex, 0, len(names))
+	for _, key := range names {
+		idx := indexes[key]
+		cols := make([]string, len(idx.Columns))
+		copy(cols, idx.Columns)
+		result = append(result, metadataIndex{
+			Name:    idx.Name,
+			Columns: cols,
+			Unique:  idx.IsUnique,
+		})
+	}
+	return result
+}
+
+func collectForeignKeys(fks map[string]*catalog.ForeignKey) []metadataForeign {
+	if len(fks) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(fks))
+	for key := range fks {
+		names = append(names, key)
+	}
+	sort.Strings(names)
+	result := make([]metadataForeign, 0, len(names))
+	for _, key := range names {
+		fk := fks[key]
+		child := make([]string, len(fk.ChildColumns))
+		copy(child, fk.ChildColumns)
+		parent := make([]string, len(fk.ParentColumns))
+		copy(parent, fk.ParentColumns)
+		result = append(result, metadataForeign{
+			Name:       fk.Name,
+			Columns:    child,
+			RefTable:   fk.ParentTable,
+			RefColumns: parent,
+		})
+	}
+	return result
+}
+
+func formatColumnType(col catalog.Column) string {
+	switch col.Type {
+	case catalog.ColumnTypeInt:
+		return "INT"
+	case catalog.ColumnTypeBigInt:
+		return "BIGINT"
+	case catalog.ColumnTypeVarChar:
+		return fmt.Sprintf("VARCHAR(%d)", col.Length)
+	case catalog.ColumnTypeBoolean:
+		return "BOOLEAN"
+	case catalog.ColumnTypeDate:
+		return "DATE"
+	case catalog.ColumnTypeTimestamp:
+		return "TIMESTAMP"
+	case catalog.ColumnTypeDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", col.Precision, col.Scale)
+	default:
+		return "UNKNOWN"
+	}
 }
