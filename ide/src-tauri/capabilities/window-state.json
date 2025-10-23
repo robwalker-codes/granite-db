@@ -1,9 +1,12 @@
 {
-  "$schema": "https://schema.tauri.app/config/capability.json",
+  "$schema": "https://schema.tauri.app/capability.json",
   "identifier": "window-state",
   "description": "Allow storing and restoring the main window size and position.",
   "windows": ["main"],
   "permissions": [
-    "window-state:default"
+    "window-state:default",
+    "window-state:allow-filename",
+    "window-state:allow-save-window-state",
+    "window-state:allow-restore-state"
   ]
 }
