@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/capability.json",
+  "identifier": "core",
+  "description": "Core runtime access required for the Granite IDE webview.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

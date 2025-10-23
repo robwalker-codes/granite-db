@@ -4,6 +4,8 @@ The Granite IDE is a cross-platform desktop companion for GraniteDB. It is built
 
 ## Installation
 
+> **Prerequisite:** Install Node.js 20 LTS (any version `>=20 <23`). Use `nvm` or your package manager to pin the version before installing dependencies.
+
 1. Ensure the Go engine is built so that `granitectl` is available on your `PATH`. Alternatively, set the `GRANITECTL_PATH` environment variable to point to the executable before launching the IDE.
 2. Install the JavaScript dependencies:
 
@@ -60,8 +62,28 @@ These commands are surfaced through the Tauri command handlers; the IDE validate
 * <kbd>Ctrl</kbd>+<kbd>L</kbd> / <kbd>⌘</kbd>+<kbd>L</kbd> – run EXPLAIN and show the plan view.
 * <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> – toggle the command palette provided by Monaco (useful for additional editor commands).
 
+## Changelog
+
+* 2025-10-23 – Migrated the desktop shell to Tauri v2, introduced explicit capability files, and standardised on Node.js 20 LTS for local development.
+
 ## Troubleshooting
 
 * If the IDE cannot find `granitectl`, set `GRANITECTL_PATH` or ensure the binary is on the system `PATH` before launching.
 * Queries that run for longer than 60 seconds are terminated and reported as timeouts; adjust the SQL and re-run.
 * Window layout, theme, and recents are stored in `granite-ide.settings.dat` within the Tauri store. Delete the file to reset the session state if necessary.
+
+## Post-change validation
+
+```bash
+# From repo root
+cd ide
+npm install
+npm run dev      # Vite prints:  http://localhost:5173/
+npm run tauri dev
+# Expect:
+# - Tauri validates config (no schema errors)
+# - It launches the window and loads the Vite app
+# - File Open/Save dialogs work (no permission errors)
+# - Settings persist (store/window-state work)
+# - Clipboard copy works if used
+```

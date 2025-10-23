@@ -17,6 +17,8 @@ Stage 8 introduces a cross-platform desktop IDE built with Tauri, React, and Typ
 
 ### Development workflow
 
+> Requires Node.js 20 LTS (any version `>=20 <23`).
+
 ```bash
 cd ide
 npm install
