@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -67,16 +67,29 @@ fn exec_sql(path: String, sql: String, format: String) -> Result<ExecResponse, S
         .to_str()
         .ok_or_else(|| "Database path contains unsupported characters".to_string())?;
     match format.as_str() {
-        "jsonRows" => {
-            let output = run_granitectl(&["exec", "--format", "json", "-q", &sql, db])?;
-            let payload: QueryResultPayload = serde_json::from_str(&output.stdout)
-                .map_err(|err| format!("Failed to parse JSON output: {err}"))?;
-            Ok(ExecResponse {
-                format,
-                output: None,
-                result: Some(payload),
-            })
-        }
+        "jsonRows" => match run_granitectl(&["exec", "--format", "json", "-q", &sql, db]) {
+            Ok(output) => {
+                let payload: QueryResultPayload = serde_json::from_str(&output.stdout)
+                    .map_err(|err| format!("Failed to parse JSON output: {err}"))?;
+                Ok(ExecResponse {
+                    format,
+                    output: None,
+                    result: Some(payload),
+                })
+            }
+            Err(err) => {
+                if is_unknown_format_error(&err) {
+                    let payload = legacy_exec_result(db, &sql)?;
+                    Ok(ExecResponse {
+                        format,
+                        output: None,
+                        result: Some(payload),
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+        },
         "table" | "csv" => {
             let output = run_granitectl(&["exec", "--format", &format, "-q", &sql, db])?;
             Ok(ExecResponse {
@@ -176,7 +189,7 @@ fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
 }
 
 fn granitectl_path() -> OsString {
-     if let Some(path) = std::env::var_os("GRANITECTL_PATH") {
+    if let Some(path) = std::env::var_os("GRANITECTL_PATH") {
         if !path.is_empty() {
             return path;
         }
@@ -195,6 +208,126 @@ fn granitectl_path() -> OsString {
     }
 
     OsString::from("granitectl")
+}
+
+fn is_unknown_format_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unknown format") || lower.contains("json format is only supported")
+}
+
+fn legacy_exec_result(db: &str, sql: &str) -> Result<QueryResultPayload, String> {
+    let start = Instant::now();
+    let output = run_granitectl(&["exec", "--format", "table", "-q", sql, db])?;
+    parse_legacy_exec_output(&output.stdout, start.elapsed())
+}
+
+fn parse_legacy_exec_output(
+    output: &str,
+    duration: Duration,
+) -> Result<QueryResultPayload, String> {
+    let mut lines: Vec<&str> = output
+        .lines()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        return Err("granitectl returned no output".into());
+    }
+
+    if lines.len() == 1 && !lines[0].starts_with('(') {
+        let message = lines[0].trim().to_string();
+        let rows_affected = extract_rows_affected(&message);
+        return Ok(QueryResultPayload {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            duration_ms: duration.as_millis() as u64,
+            rows_affected,
+            message: Some(message),
+        });
+    }
+
+    let mut rows_affected = None;
+    let mut message = None;
+    if let Some(last) = lines.last() {
+        if let Some(count) = parse_row_count_line(last) {
+            lines.pop();
+            if count > 0 {
+                rows_affected = Some(count as u64);
+            }
+            message = Some(format!("{count} row(s)"));
+        }
+    }
+
+    if lines.len() < 2 {
+        return Err("unexpected table output".into());
+    }
+
+    let columns = split_table_row(lines[0]);
+    if columns.is_empty() {
+        return Err("missing column definitions".into());
+    }
+
+    let mut data_rows = Vec::new();
+    for line in lines.iter().skip(2) {
+        let values = split_table_row(line);
+        if values.len() != columns.len() {
+            return Err("row column count mismatch".into());
+        }
+        data_rows.push(values);
+    }
+
+    if rows_affected.is_none() {
+        let count = data_rows.len() as u64;
+        if count > 0 {
+            rows_affected = Some(count);
+        }
+        if message.is_none() {
+            message = Some(format!("{} row(s)", count));
+        }
+    }
+
+    Ok(QueryResultPayload {
+        columns,
+        rows: data_rows,
+        duration_ms: duration.as_millis() as u64,
+        rows_affected,
+        message,
+    })
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    line.split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+fn parse_row_count_line(line: &str) -> Option<u64> {
+    let trimmed = line.trim();
+    let without_prefix = trimmed.strip_prefix('(')?;
+    let without_suffix = without_prefix.strip_suffix(")")?;
+    let (number_part, rest) = without_suffix.split_once(' ')?;
+    if rest != "row(s)" {
+        return None;
+    }
+    number_part.parse().ok()
+}
+
+fn extract_rows_affected(message: &str) -> Option<u64> {
+    let mut digits = String::new();
+    let mut seen_digit = false;
+    for ch in message.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            seen_digit = true;
+        } else if seen_digit {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok().filter(|value: &u64| *value > 0)
 }
 
 fn legacy_metadata(db: &str) -> Result<String, String> {
@@ -452,6 +585,7 @@ struct LegacyForeignKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parses_empty_dump() {
@@ -533,6 +667,45 @@ mod tests {
             ]
         });
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parses_legacy_select_rows() {
+        let output = "id | name\n-- | ----\n1 | Ada\n2 | Grace\n(2 row(s))\n";
+        let result = parse_legacy_exec_output(output, Duration::from_millis(7)).unwrap();
+        assert_eq!(result.columns, vec!["id", "name"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec!["1".into(), "Ada".into()],
+                vec!["2".into(), "Grace".into()]
+            ]
+        );
+        assert_eq!(result.duration_ms, 7);
+        assert_eq!(result.rows_affected, Some(2));
+        assert_eq!(result.message.as_deref(), Some("2 row(s)"));
+    }
+
+    #[test]
+    fn parses_legacy_message_only() {
+        let output = "3 row(s) inserted\n";
+        let result = parse_legacy_exec_output(output, Duration::from_millis(12)).unwrap();
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+        assert_eq!(result.duration_ms, 12);
+        assert_eq!(result.rows_affected, Some(3));
+        assert_eq!(result.message.as_deref(), Some("3 row(s) inserted"));
+    }
+
+    #[test]
+    fn parses_legacy_zero_row_select() {
+        let output = "id | name\n-- | ----\n(0 row(s))\n";
+        let result = parse_legacy_exec_output(output, Duration::from_millis(5)).unwrap();
+        assert_eq!(result.columns, vec!["id", "name"]);
+        assert!(result.rows.is_empty());
+        assert_eq!(result.duration_ms, 5);
+        assert_eq!(result.rows_affected, None);
+        assert_eq!(result.message.as_deref(), Some("0 row(s)"));
     }
 }
 
