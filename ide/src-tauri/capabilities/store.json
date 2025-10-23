@@ -1,9 +1,14 @@
 {
-  "$schema": "https://schema.tauri.app/config/capability.json",
+  "$schema": "https://schema.tauri.app/capability.json",
   "identifier": "store",
   "description": "Persist IDE settings via the Tauri store plugin.",
   "windows": ["main"],
   "permissions": [
-    "store:default"
+    "store:default",
+    "store:allow-get-store",
+    "store:allow-load",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-save"
   ]
 }

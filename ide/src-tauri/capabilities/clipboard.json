@@ -1,5 +1,5 @@
 {
-  "$schema": "https://schema.tauri.app/config/capability.json",
+  "$schema": "https://schema.tauri.app/capability.json",
   "identifier": "clipboard",
   "description": "Allow copying query results to the system clipboard.",
   "windows": ["main"],
