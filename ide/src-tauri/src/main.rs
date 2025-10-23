@@ -55,6 +55,25 @@ fn open_db(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn create_db(path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    if path.exists() {
+        return Err("Database file already exists".into());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Unable to create parent directory: {err}"))?;
+        }
+    }
+    let db = path
+        .to_str()
+        .ok_or_else(|| "Database path contains unsupported characters".to_string())?;
+    run_granitectl(&["new", db])?;
+    Ok(())
+}
+
+#[tauri::command]
 fn exec_sql(path: String, sql: String, format: String) -> Result<ExecResponse, String> {
     if sql.trim().is_empty() {
         return Err("SQL must not be empty".into());
@@ -361,7 +380,8 @@ fn parse_legacy_metadata(output: &str) -> Result<String, String> {
                 .split_once(" (")
                 .ok_or_else(|| format!("unexpected table header: {line}"))?;
             let rows_part = rows_part
-                .trim_end_matches(')')
+                .strip_suffix(")")
+                .ok_or_else(|| format!("unexpected row count: {line}"))?
                 .strip_suffix(" row(s)")
                 .ok_or_else(|| format!("unexpected row count: {line}"))?;
             let row_count = rows_part
@@ -625,6 +645,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_zero_row_table() {
+        let dump = "Table people (0 row(s))\n  - id INT PRIMARY KEY\n";
+        let json = parse_legacy_metadata(dump).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected = serde_json::json!({
+            "tables": [
+                {
+                    "name": "people",
+                    "rowCount": 0,
+                    "columns": [
+                        {
+                            "name": "id",
+                            "type": "INT",
+                            "notNull": false,
+                            "pk": true
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
     fn parses_indexes_and_foreign_keys() {
         let dump = "Table orders (1 row(s))\n  - id INT PRIMARY KEY\n  - customer_id INT NOT NULL\n  Indexes:\n    - idx_orders_customer (customer_id) UNIQUE\n  Foreign Keys:\n    - fk_orders_customer (customer_id) REFERENCES customers(id)\n";
         let json = parse_legacy_metadata(dump).unwrap();
@@ -718,6 +762,7 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             open_db,
+            create_db,
             exec_sql,
             explain_sql,
             metadata,

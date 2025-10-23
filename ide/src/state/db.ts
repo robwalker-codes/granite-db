@@ -47,6 +47,10 @@ export interface ExecResponse {
   result?: QueryResult;
 }
 
+export async function createDatabase(path: string): Promise<void> {
+  await invoke("create_db", { path });
+}
+
 export async function openDatabase(path: string): Promise<void> {
   await invoke("open_db", { path });
 }

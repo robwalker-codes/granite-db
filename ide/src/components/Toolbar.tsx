@@ -8,6 +8,7 @@ interface ToolbarProps {
   onExplain(): void;
   onExport(): void;
   onOpen(): void;
+  onCreate(): void;
   onSelectRecent(path: string): void;
   isRunning: boolean;
   dbPath: string | null;
@@ -21,6 +22,7 @@ export default function Toolbar({
   onExplain,
   onExport,
   onOpen,
+  onCreate,
   onSelectRecent,
   isRunning,
   dbPath,
@@ -80,6 +82,21 @@ export default function Toolbar({
           >
             <Menu.Items className="absolute right-0 z-10 mt-2 w-72 origin-top-right divide-y divide-slate-200 rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none dark:divide-slate-700 dark:bg-slate-800">
               <div className="px-1 py-1">
+                <Menu.Item>
+                  {({ active }) => (
+                    <button
+                      type="button"
+                      onClick={onCreate}
+                      className={clsx(
+                        "flex w-full items-center rounded-md px-2 py-2 text-sm",
+                        active ? "bg-slate-100 dark:bg-slate-700" : "",
+                        "text-left"
+                      )}
+                    >
+                      File → New Database…
+                    </button>
+                  )}
+                </Menu.Item>
                 <Menu.Item>
                   {({ active }) => (
                     <button

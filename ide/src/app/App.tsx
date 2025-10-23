@@ -9,7 +9,7 @@ import PlanView from "../components/PlanView";
 import Toolbar from "../components/Toolbar";
 import StatusBar from "../components/StatusBar";
 import { SessionProvider, useSession } from "../state/session";
-import { executeQuery, explainQuery, exportCsv, fetchMetadata, openDatabase, type DatabaseTable } from "../state/db";
+import { createDatabase, executeQuery, explainQuery, exportCsv, fetchMetadata, openDatabase, type DatabaseTable } from "../state/db";
 import type { QueryResult } from "../state/db";
 
 function AppShell() {
@@ -104,6 +104,31 @@ function AppShell() {
     }
   }, [addRecentPath, setDbPath, setMetadata, setStatus]);
 
+  const handleCreateDatabase = useCallback(async () => {
+    const destination = await save({
+      defaultPath: "granite-db.gdb",
+      filters: [{ name: "Granite Database", extensions: ["gdb", "db"] }]
+    });
+    if (!destination || Array.isArray(destination)) {
+      return;
+    }
+    try {
+      await createDatabase(destination);
+      await openDatabase(destination);
+      const metadata = await fetchMetadata(destination);
+      setDbPath(destination);
+      setMetadata(metadata);
+      setResult(null);
+      setPlan(null);
+      setError(null);
+      await addRecentPath(destination);
+      setStatus(`Created ${destination}`, null, null);
+      toast.success(`Created ${destination}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    }
+  }, [addRecentPath, setDbPath, setError, setMetadata, setPlan, setResult, setStatus]);
+
   const handleSelectRecent = useCallback(
     async (path: string) => {
       try {
@@ -184,6 +209,7 @@ function AppShell() {
         onExplain={() => explain(state.editorText)}
         onExport={handleExportCsv}
         onOpen={handleOpen}
+        onCreate={handleCreateDatabase}
         onSelectRecent={handleSelectRecent}
         isRunning={state.isRunning}
         dbPath={state.dbPath}
