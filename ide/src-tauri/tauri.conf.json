@@ -13,12 +13,12 @@
     "security": {
       "csp": null,
       "capabilities": [
-        "capabilities/core.json",
-        "capabilities/dialog.json",
-        "capabilities/fs.json",
-        "capabilities/clipboard.json",
-        "capabilities/store.json",
-        "capabilities/window-state.json"
+        "core",
+        "dialog",
+        "fs",
+        "clipboard",
+        "store",
+        "window-state"
       ]
     },
     "windows": [
@@ -34,12 +34,16 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.icns",
+      "icons/32x32.png",
+      "icons/128x128.png"
+    ]
   },
   "plugins": {
-    "store": {
-      "defaults": {}
-    },
-    "window-state": {}
+    "store": null,
+    "window-state": null
   }
 }
