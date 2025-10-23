@@ -11,6 +11,7 @@ import (
 	"github.com/example/granite-db/engine/internal/storage"
 	"github.com/example/granite-db/engine/internal/storage/indexmgr"
 	"github.com/example/granite-db/engine/internal/txn"
+	"github.com/example/granite-db/engine/internal/wal"
 )
 
 func TestExecutorSelectExpressions(t *testing.T) {
@@ -171,16 +172,21 @@ func newExecutor(t *testing.T, path string) (*engineexec.Executor, *txn.Manager,
 	if err != nil {
 		t.Fatalf("storage open: %v", err)
 	}
+	log, err := wal.Open(path)
+	if err != nil {
+		t.Fatalf("wal open: %v", err)
+	}
 	cat, err := catalog.Load(mgr)
 	if err != nil {
 		t.Fatalf("catalog load: %v", err)
 	}
 	idx := indexmgr.New(mgr.Path())
 	locks := txn.NewLockManager(0)
-	executor := engineexec.New(cat, mgr, idx, locks)
-	txns := txn.NewManager(locks)
+	executor := engineexec.New(cat, mgr, idx, locks, log)
+	txns := txn.NewManager(locks, log)
 	cleanup := func() {
 		idx.Close()
+		log.Close()
 		mgr.Close()
 	}
 	return executor, txns, cleanup

@@ -18,6 +18,7 @@ import (
 	"github.com/example/granite-db/engine/internal/storage"
 	"github.com/example/granite-db/engine/internal/storage/indexmgr"
 	"github.com/example/granite-db/engine/internal/txn"
+	"github.com/example/granite-db/engine/internal/wal"
 )
 
 // Result describes the outcome of executing a SQL statement.
@@ -34,6 +35,7 @@ type Executor struct {
 	storage *storage.Manager
 	indexes *indexmgr.Manager
 	locks   *txn.LockManager
+	wal     *wal.Manager
 }
 
 type indexInfo struct {
@@ -81,8 +83,8 @@ type referencingForeignKey struct {
 var errStopScan = errors.New("stop scan")
 
 // New creates an executor for the given catalog and storage manager.
-func New(cat *catalog.Catalog, mgr *storage.Manager, idx *indexmgr.Manager, locks *txn.LockManager) *Executor {
-	return &Executor{catalog: cat, storage: mgr, indexes: idx, locks: locks}
+func New(cat *catalog.Catalog, mgr *storage.Manager, idx *indexmgr.Manager, locks *txn.LockManager, log *wal.Manager) *Executor {
+	return &Executor{catalog: cat, storage: mgr, indexes: idx, locks: locks, wal: log}
 }
 
 func (e *Executor) acquireTableLock(tx *txn.Transaction, table string, mode txn.LockMode) error {
@@ -436,21 +438,21 @@ func (e *Executor) executeInsert(tx *txn.Transaction, stmt *parser.InsertStmt) (
 		if err != nil {
 			return nil, err
 		}
-		rid, err := heap.Insert(encoded)
+		rid, err := heap.Insert(tx, e.wal, encoded)
 		if err != nil {
 			return nil, err
 		}
 		if err := e.acquireRowLock(tx, table.Name, rid, txn.LockModeExclusive); err != nil {
-			_ = heap.Delete(rid)
+			_ = heap.Delete(tx, e.wal, rid)
 			return nil, err
 		}
 		if err := e.insertIntoIndexes(table, indexInfos, values, rid); err != nil {
-			_ = heap.Delete(rid)
+			_ = heap.Delete(tx, e.wal, rid)
 			return nil, err
 		}
 		if err := e.catalog.IncrementRowCount(table.Name); err != nil {
 			_ = e.removeFromIndexes(table, indexInfos, values, rid)
-			_ = heap.Delete(rid)
+			_ = heap.Delete(tx, e.wal, rid)
 			return nil, err
 		}
 		valuesCopy := cloneValues(values)
@@ -458,7 +460,7 @@ func (e *Executor) executeInsert(tx *txn.Transaction, stmt *parser.InsertStmt) (
 			if err := e.removeFromIndexes(table, indexInfos, valuesCopy, rid); err != nil {
 				return err
 			}
-			if err := heap.Delete(rid); err != nil {
+			if err := heap.Delete(tx, e.wal, rid); err != nil {
 				return err
 			}
 			if err := e.catalog.DecrementRowCount(table.Name); err != nil {
@@ -522,13 +524,13 @@ func (e *Executor) executeDelete(tx *txn.Transaction, stmt *parser.DeleteStmt) (
 		if err := e.removeFromIndexes(validated.Table, indexInfos, values, rid); err != nil {
 			return err
 		}
-		if err := heap.Delete(rid); err != nil {
+		if err := heap.Delete(tx, e.wal, rid); err != nil {
 			return err
 		}
 		if err := e.catalog.DecrementRowCount(validated.Table.Name); err != nil {
 			encoded, encErr := EncodeRow(validated.Table.Columns, values)
 			if encErr == nil {
-				if restoredRID, insErr := heap.Insert(encoded); insErr == nil {
+				if restoredRID, insErr := heap.Insert(tx, e.wal, encoded); insErr == nil {
 					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
 				}
 			}
@@ -540,7 +542,7 @@ func (e *Executor) executeDelete(tx *txn.Transaction, stmt *parser.DeleteStmt) (
 			if err != nil {
 				return err
 			}
-			restoredRID, err := heap.Insert(encoded)
+			restoredRID, err := heap.Insert(tx, e.wal, encoded)
 			if err != nil {
 				return err
 			}
@@ -656,18 +658,18 @@ func (e *Executor) executeUpdate(tx *txn.Transaction, stmt *parser.UpdateStmt) (
 		if err := e.removeFromIndexes(validated.Table, indexInfos, values, rid); err != nil {
 			return err
 		}
-		if err := heap.Delete(rid); err != nil {
+		if err := heap.Delete(tx, e.wal, rid); err != nil {
 			return err
 		}
 		encodedNew, err := EncodeRow(validated.Table.Columns, newValues)
 		if err != nil {
 			return err
 		}
-		newRid, err := heap.Insert(encodedNew)
+		newRid, err := heap.Insert(tx, e.wal, encodedNew)
 		if err != nil {
 			encodedOld, encErr := EncodeRow(validated.Table.Columns, values)
 			if encErr == nil {
-				if restoredRID, insErr := heap.Insert(encodedOld); insErr == nil {
+				if restoredRID, insErr := heap.Insert(tx, e.wal, encodedOld); insErr == nil {
 					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
 				}
 			}
@@ -675,10 +677,10 @@ func (e *Executor) executeUpdate(tx *txn.Transaction, stmt *parser.UpdateStmt) (
 		}
 		if err := e.insertIntoIndexes(validated.Table, indexInfos, newValues, newRid); err != nil {
 			_ = e.removeFromIndexes(validated.Table, indexInfos, newValues, newRid)
-			_ = heap.Delete(newRid)
+			_ = heap.Delete(tx, e.wal, newRid)
 			encodedOld, encErr := EncodeRow(validated.Table.Columns, values)
 			if encErr == nil {
-				if restoredRID, insErr := heap.Insert(encodedOld); insErr == nil {
+				if restoredRID, insErr := heap.Insert(tx, e.wal, encodedOld); insErr == nil {
 					_ = e.insertIntoIndexes(validated.Table, indexInfos, values, restoredRID)
 				}
 			}
@@ -690,14 +692,14 @@ func (e *Executor) executeUpdate(tx *txn.Transaction, stmt *parser.UpdateStmt) (
 			if err := e.removeFromIndexes(validated.Table, indexInfos, newCopy, newRid); err != nil {
 				return err
 			}
-			if err := heap.Delete(newRid); err != nil {
+			if err := heap.Delete(tx, e.wal, newRid); err != nil {
 				return err
 			}
 			encodedOld, err := EncodeRow(validated.Table.Columns, oldCopy)
 			if err != nil {
 				return err
 			}
-			restoredRID, err := heap.Insert(encodedOld)
+			restoredRID, err := heap.Insert(tx, e.wal, encodedOld)
 			if err != nil {
 				return err
 			}

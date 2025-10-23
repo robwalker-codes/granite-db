@@ -48,6 +48,42 @@ Each modification is recorded in the write-ahead log before the corresponding
 page changes land on disk. On restart the REDO log replays structural updates so
 that heap and index state stay in sync.
 
+### WAL write ordering
+
+GraniteDB enforces the classical WAL rule: log records reach durable storage
+before their associated data pages. Every page flush is preceded by an append
+and `fsync` of the WAL segment, guaranteeing that recovery always has the bytes
+required to redo the change. Commit and abort markers follow the same pattern so
+that transaction status is durable even if the process crashes immediately after
+returning control to the caller.
+
+```
++-------------+    +-----------------+
+| Page change | -> | WAL append      |
++-------------+    +-----------------+
+        |                |
+        v                v
++-------------+    +-----------------+
+| WAL fsync   | -> | Data page write |
++-------------+    +-----------------+
+        |                |
+        v                v
++-------------+    +-----------------+
+| Commit log  | -> | WAL fsync (end) |
++-------------+    +-----------------+
+```
+
+### Basic recovery (no checkpoints)
+
+At startup the engine scans the WAL from the beginning of the current segment,
+validating checksums as it goes. Transactions with a visible commit record are
+replayed in log order by writing their captured page images back to disk. Log
+records belonging to transactions that end with an abort marker—or never
+produce a commit—are ignored. Corrupted or truncated tails stop the scan so the
+recovery loop replays only the prefix with valid checksums. Checkpoints arrive
+in Stage 6B-ii, so the current implementation performs a full scan on every
+restart.
+
 ## Planner flow
 
 The logical planner remains rule-driven. Stage 4 introduces a heuristic that

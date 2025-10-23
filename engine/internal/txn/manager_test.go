@@ -8,7 +8,7 @@ import (
 
 func TestManagerLifecycle(t *testing.T) {
 	locks := txn.NewLockManager(0)
-	mgr := txn.NewManager(locks)
+	mgr := txn.NewManager(locks, nil)
 
 	tx := mgr.Begin()
 	if tx.ID() == 0 {

@@ -3,7 +3,10 @@
 GraniteDB offers a compact SQL surface aimed at analytical tinkering. Stage 6
 extends the earlier indexing, constraint, and execution work with explicit
 transactions, a lock manager, and Read Committed isolation while retaining the
-existing expression grammar and join pipeline.
+existing expression grammar and join pipeline. Durability now comes from the
+write-ahead log: COMMIT does not return until its record has been flushed to
+disk, and crash recovery replays the WAL from the beginning (checkpoints arrive
+in Stage 6B-ii).
 
 ## Projection expressions
 

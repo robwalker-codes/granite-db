@@ -9,7 +9,7 @@ import (
 
 func TestLockManagerSharedCompatibility(t *testing.T) {
 	locks := txn.NewLockManager(0)
-	mgr := txn.NewManager(locks)
+	mgr := txn.NewManager(locks, nil)
 
 	tx1 := mgr.Begin()
 	tx2 := mgr.Begin()
@@ -31,7 +31,7 @@ func TestLockManagerSharedCompatibility(t *testing.T) {
 
 func TestLockManagerExclusiveTimeout(t *testing.T) {
 	locks := txn.NewLockManager(50 * time.Millisecond)
-	mgr := txn.NewManager(locks)
+	mgr := txn.NewManager(locks, nil)
 
 	tx1 := mgr.Begin()
 	tx2 := mgr.Begin()
