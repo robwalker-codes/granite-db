@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -45,6 +46,96 @@ func TestEndToEndWorkflow(t *testing.T) {
 	}
 	if res.Rows[1][0] != "2" || res.Rows[1][1] != "Grace" {
 		t.Fatalf("unexpected second row: %v", res.Rows[1])
+	}
+}
+
+func TestExecuteJSONReturnsStructuredPayload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "json.gdb")
+	if err := api.Create(path); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db, err := api.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	mustExec(t, db, "CREATE TABLE metrics(id INT PRIMARY KEY, value INT)")
+	mustExec(t, db, "INSERT INTO metrics VALUES (1, 42)")
+
+	raw, err := db.ExecuteJSON("SELECT id, value FROM metrics")
+	if err != nil {
+		t.Fatalf("ExecuteJSON: %v", err)
+	}
+	var payload struct {
+		Columns    []string   `json:"columns"`
+		Rows       [][]string `json:"rows"`
+		DurationMs int64      `json:"durationMs"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(payload.Columns) != 2 || payload.Columns[0] != "id" {
+		t.Fatalf("unexpected columns: %v", payload.Columns)
+	}
+	if len(payload.Rows) != 1 || payload.Rows[0][0] != "1" {
+		t.Fatalf("unexpected rows: %v", payload.Rows)
+	}
+	if payload.DurationMs < 0 {
+		t.Fatalf("expected non-negative duration, got %d", payload.DurationMs)
+	}
+}
+
+func TestMetadataJSONReflectsSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meta.gdb")
+	if err := api.Create(path); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	db, err := api.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	mustExec(t, db, "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(20))")
+	mustExec(t, db, "CREATE INDEX idx_customers_name ON customers(name)")
+
+	raw, err := db.MetadataJSON()
+	if err != nil {
+		t.Fatalf("MetadataJSON: %v", err)
+	}
+	var payload struct {
+		Tables []struct {
+			Name    string `json:"name"`
+			Columns []struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+			} `json:"columns"`
+			Indexes []struct {
+				Name string `json:"name"`
+			} `json:"indexes"`
+		} `json:"tables"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(payload.Tables) != 1 {
+		t.Fatalf("expected 1 table, got %d", len(payload.Tables))
+	}
+	table := payload.Tables[0]
+	if table.Name != "customers" {
+		t.Fatalf("unexpected table %s", table.Name)
+	}
+	if len(table.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(table.Columns))
+	}
+	if table.Columns[0].Type == "" {
+		t.Fatalf("expected column type to be populated")
+	}
+	if len(table.Indexes) != 1 || table.Indexes[0].Name != "idx_customers_name" {
+		t.Fatalf("unexpected indexes: %v", table.Indexes)
 	}
 }
 

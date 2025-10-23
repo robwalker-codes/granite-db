@@ -11,6 +11,28 @@ cd engine
 go build ./...
 ```
 
+## Granite IDE
+
+Stage 8 introduces a cross-platform desktop IDE built with Tauri, React, and TypeScript. The IDE talks directly to the engine via `granitectl`, exposing a schema explorer, Monaco-powered SQL editor, results grid, CSV export, and a visual EXPLAIN plan viewer. Settings such as recent databases and theme preference are persisted using the Tauri store plugin.
+
+### Development workflow
+
+```bash
+cd ide
+npm install
+npm run tauri dev
+```
+
+### Building a release bundle
+
+```bash
+cd ide
+npm install
+npm run tauri build
+```
+
+The IDE usage guide, shortcuts, and feature tour live in [docs/ide.md](docs/ide.md).
+
 ### Creating a database
 
 ```bash
@@ -28,6 +50,8 @@ cd engine
 ./granitectl exec -q "SELECT * FROM people;" demo.gdb
 ./granitectl exec -q "CREATE INDEX idx_people_name ON people(name);" demo.gdb
 ./granitectl explain -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
+./granitectl exec --format json -q "SELECT * FROM people;" demo.gdb
+./granitectl meta --json demo.gdb
 ```
 
 Foreign keys now protect parent/child relationships immediately:
@@ -126,6 +150,13 @@ cd engine
 ./granitectl exec -q "SELECT * FROM people;" --format csv demo.gdb
 ```
 
+Use the JSON format when integrating with scripts and the IDE:
+
+```bash
+cd engine
+./granitectl exec --format json -q "SELECT id, name FROM people;" demo.gdb
+```
+
 ### Explaining a query
 
 The `explain` verb prints a lightweight operator tree and JSON payload for integration with tooling.
@@ -156,6 +187,8 @@ cd engine
 * Explicit transactions with Read Committed isolation, shared/exclusive table locks, row-level exclusive locks, and descriptive lock timeouts.
 * Write-ahead logging (REDO) underpinning transaction durability.
 * Command-line client for database lifecycle management, transaction-aware query execution, script running, CSV exports, and plan inspection.
+* Machine-readable JSON execution and metadata output for tooling integrations.
+* Cross-platform desktop IDE with schema explorer, SQL editor, results viewer, CSV export, and plan visualiser.
 
 ## Current limitations
 

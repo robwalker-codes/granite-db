@@ -31,6 +31,8 @@ func main() {
 		runDump(os.Args[2:])
 	case "explain":
 		runExplain(os.Args[2:])
+	case "meta":
+		runMeta(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
@@ -42,9 +44,10 @@ func usage() {
 	fmt.Println("GraniteDB control utility")
 	fmt.Println("Usage:")
 	fmt.Println("  granitectl new <dbfile>")
-	fmt.Println("  granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv] [--continue-on-error] <dbfile>")
+	fmt.Println("  granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv|json] [--continue-on-error] <dbfile>")
 	fmt.Println("  granitectl dump <dbfile>")
 	fmt.Println("  granitectl explain -q <SQL> [--json] [--out <file>] <dbfile>")
+	fmt.Println("  granitectl meta [--json] <dbfile>")
 }
 
 func runNew(args []string) {
@@ -69,10 +72,10 @@ func runExec(args []string) {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	query := fs.String("q", "", "SQL query to execute")
 	script := fs.String("f", "", "Path to SQL script file")
-	format := fs.String("format", "table", "Output format: table or csv")
+	format := fs.String("format", "table", "Output format: table, csv, or json")
 	continueOnError := fs.Bool("continue-on-error", false, "Continue script execution after errors")
 	fs.Usage = func() {
-		fmt.Println("Usage: granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv] [--continue-on-error] <dbfile>")
+		fmt.Println("Usage: granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv|json] [--continue-on-error] <dbfile>")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -100,6 +103,22 @@ func runExec(args []string) {
 			fmt.Fprintln(os.Stderr, "error: no statements to execute")
 			os.Exit(1)
 		}
+		if *format == "json" {
+			if len(statements) != 1 {
+				fmt.Fprintln(os.Stderr, "error: JSON format requires a single statement")
+				os.Exit(1)
+			}
+			payload, err := db.ExecuteJSON(statements[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			if err := printJSON(payload); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		for _, stmt := range statements {
 			result, err := db.Execute(stmt)
 			if err != nil {
@@ -114,6 +133,10 @@ func runExec(args []string) {
 		return
 	}
 
+	if *format == "json" {
+		fmt.Fprintln(os.Stderr, "error: JSON format is only supported with -q")
+		os.Exit(1)
+	}
 	if err := execScript(db, *script, *format, *continueOnError); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -236,6 +259,90 @@ func runExplain(args []string) {
 	}
 }
 
+func runMeta(args []string) {
+	fs := flag.NewFlagSet("meta", flag.ExitOnError)
+	jsonOnly := fs.Bool("json", false, "Output metadata as JSON")
+	fs.Usage = func() {
+		fmt.Println("Usage: granitectl meta [--json] <dbfile>")
+	}
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		fs.Usage()
+		os.Exit(1)
+	}
+	db, err := api.Open(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	if *jsonOnly {
+		data, err := db.MetadataJSON()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := printJSON(data); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	tables, err := db.Tables()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(tables) == 0 {
+		fmt.Println("No tables defined")
+		return
+	}
+	for _, table := range tables {
+		fmt.Printf("Table %s (%d row(s))\n", table.Name, table.RowCount)
+		for _, col := range table.Columns {
+			fmt.Printf("  - %s %s", col.Name, describeType(col))
+			if col.NotNull {
+				fmt.Print(" NOT NULL")
+			}
+			if col.PrimaryKey {
+				fmt.Print(" PRIMARY KEY")
+			}
+			fmt.Println()
+		}
+		if len(table.Indexes) > 0 {
+			fmt.Println("  Indexes:")
+			names := make([]string, 0, len(table.Indexes))
+			for name := range table.Indexes {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				idx := table.Indexes[name]
+				fmt.Printf("    - %s (%s)", idx.Name, strings.Join(idx.Columns, ", "))
+				if idx.IsUnique {
+					fmt.Print(" UNIQUE")
+				}
+				fmt.Println()
+			}
+		}
+		if len(table.ForeignKeys) > 0 {
+			fmt.Println("  Foreign Keys:")
+			names := make([]string, 0, len(table.ForeignKeys))
+			for name := range table.ForeignKeys {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				fk := table.ForeignKeys[name]
+				fmt.Printf("    - %s (%s) REFERENCES %s(%s)\n", fk.Name, strings.Join(fk.ChildColumns, ", "), fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+			}
+		}
+		fmt.Println()
+	}
+}
+
 func describeType(col catalog.Column) string {
 	switch col.Type {
 	case catalog.ColumnTypeInt:
@@ -329,7 +436,7 @@ func printRow(w io.Writer, values []string, widths []int) {
 
 func validateFormat(format string) error {
 	switch format {
-	case "table", "csv":
+	case "table", "csv", "json":
 		return nil
 	default:
 		return fmt.Errorf("unknown format %s", format)
