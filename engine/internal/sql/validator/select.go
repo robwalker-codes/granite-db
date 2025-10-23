@@ -29,9 +29,11 @@ type ValidatedSelect struct {
 	Bindings   []ColumnBinding
 	Outputs    []OutputColumn
 	Filter     expr.TypedExpr
+	FilterText string
 	Groupings  []Grouping
 	Aggregates []AggregateDefinition
 	Having     expr.TypedExpr
+	HavingText string
 	OrderBy    []OrderingTerm
 	Limit      *parser.LimitClause
 }
@@ -106,6 +108,7 @@ type EquiCondition struct {
 type JoinClause struct {
 	Type           JoinType
 	Condition      expr.TypedExpr
+	ConditionText  string
 	EquiConditions []EquiCondition
 	Residuals      []expr.TypedExpr
 	Right          *TableSource
@@ -132,6 +135,7 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		outputs    []OutputColumn
 		aggregates []AggregateDefinition
 		having     expr.TypedExpr
+		havingText string
 		orderBy    []OrderingTerm
 	)
 
@@ -149,6 +153,7 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 			if having.ResultType().Kind != expr.TypeBoolean && having.ResultType().Kind != expr.TypeNull {
 				return nil, fmt.Errorf("validator: HAVING clause must evaluate to BOOLEAN")
 			}
+			havingText = parser.FormatExpression(stmt.Having)
 		}
 		orderBy, err = validator.buildAggregatedOrdering(stmt.OrderBy, builder, outputs)
 		if err != nil {
@@ -169,7 +174,10 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		}
 	}
 
-	var filter expr.TypedExpr
+	var (
+		filter     expr.TypedExpr
+		filterText string
+	)
 	if stmt.Where != nil {
 		filter, err = validator.buildExpression(stmt.Where, "WHERE clause")
 		if err != nil {
@@ -178,6 +186,7 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		if filter.ResultType().Kind != expr.TypeBoolean {
 			return nil, fmt.Errorf("validator: WHERE clause must evaluate to BOOLEAN")
 		}
+		filterText = parser.FormatExpression(stmt.Where)
 	}
 
 	return &ValidatedSelect{
@@ -186,9 +195,11 @@ func ValidateSelect(cat *catalog.Catalog, stmt *parser.SelectStmt) (*ValidatedSe
 		Bindings:   validator.bindings(),
 		Outputs:    outputs,
 		Filter:     filter,
+		FilterText: filterText,
 		Groupings:  groupingInfo.toGroupings(),
 		Aggregates: aggregates,
 		Having:     having,
+		HavingText: havingText,
 		OrderBy:    orderBy,
 		Limit:      stmt.Limit,
 	}, nil
@@ -474,6 +485,7 @@ func (v *selectValidator) buildFrom(node parser.TableExpr) ([]*JoinClause, error
 		join := &JoinClause{
 			Type:           mapJoinType(t.Type),
 			Condition:      condition,
+			ConditionText:  parser.FormatExpression(t.Condition),
 			EquiConditions: equi,
 			Residuals:      residuals,
 			Right:          right,

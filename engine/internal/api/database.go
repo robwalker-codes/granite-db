@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -196,6 +197,32 @@ func (db *Database) Explain(sql string) (*exec.Plan, error) {
 		return nil, err
 	}
 	return plan, nil
+}
+
+// ExplainJSON serialises the physical plan for the provided SQL statement.
+func (db *Database) ExplainJSON(sql string) ([]byte, error) {
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := db.executor.Explain(stmt)
+	if err != nil {
+		return nil, err
+	}
+	physical, err := db.executor.PhysicalPlan(stmt)
+	if err != nil {
+		return nil, err
+	}
+	payload := struct {
+		Version  int                    `json:"version"`
+		Physical *exec.PhysicalPlanNode `json:"physical,omitempty"`
+		Text     string                 `json:"text"`
+	}{
+		Version:  1,
+		Physical: physical,
+		Text:     plan.Text(),
+	}
+	return json.Marshal(payload)
 }
 
 // Tables returns copies of table metadata for inspection.
