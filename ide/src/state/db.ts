@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import type { ExplainPayload } from "../lib/planTypes";
 
 export interface DatabaseColumn {

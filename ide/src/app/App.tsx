@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
-import { open, save } from "@tauri-apps/api/dialog";
-import { writeText } from "@tauri-apps/api/clipboard";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Toaster, toast } from "react-hot-toast";
 import Sidebar from "../components/Sidebar";
 import SqlEditor from "../components/Editor";

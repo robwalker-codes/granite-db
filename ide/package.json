@@ -21,6 +21,8 @@
     "@headlessui/react": "^1.7.17",
     "@monaco-editor/react": "^4.5.4",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-clipboard-manager": "^2.3.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
     "@tauri-apps/plugin-store": "^2.0.0",
     "clsx": "^2.1.0",
     "monaco-editor": "^0.45.0",
