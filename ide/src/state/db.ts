@@ -76,7 +76,20 @@ export async function executeQuery(path: string, sql: string): Promise<Result<Qu
   if (!payload || payload.format !== "jsonRows" || !payload.result) {
     return { ok: false, error: "Unexpected response from engine" };
   }
-  return { ok: true, value: payload.result };
+  const { result } = payload;
+  const columns = Array.isArray(result.columns) ? result.columns.map((col) => String(col)) : [];
+  const rows = Array.isArray(result.rows)
+    ? result.rows.map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? "")) : []))
+    : [];
+  const durationMs = typeof result.durationMs === "number" ? result.durationMs : 0;
+  const normalized: QueryResult = {
+    columns,
+    rows,
+    durationMs,
+    rowsAffected: result.rowsAffected,
+    message: result.message
+  };
+  return { ok: true, value: normalized };
 }
 
 export async function explainQuery(path: string, sql: string): Promise<Result<ExplainPayload>> {
