@@ -13,6 +13,7 @@ import (
 	"github.com/example/granite-db/engine/internal/storage"
 	"github.com/example/granite-db/engine/internal/storage/indexmgr"
 	"github.com/example/granite-db/engine/internal/txn"
+	"github.com/example/granite-db/engine/internal/wal"
 )
 
 // Database provides a public façade over the GraniteDB engine.
@@ -23,6 +24,7 @@ type Database struct {
 	indexes  *indexmgr.Manager
 	locks    *txn.LockManager
 	txns     *txn.Manager
+	wal      *wal.Manager
 	mu       sync.Mutex
 	sessions map[int64]*txn.Transaction
 }
@@ -38,21 +40,33 @@ func Open(path string) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
+	log, err := wal.Open(path)
+	if err != nil {
+		mgr.Close()
+		return nil, err
+	}
+	if err := recoverDatabase(mgr, log); err != nil {
+		log.Close()
+		mgr.Close()
+		return nil, err
+	}
 	cat, err := catalog.Load(mgr)
 	if err != nil {
+		log.Close()
 		mgr.Close()
 		return nil, err
 	}
 	idx := indexmgr.New(mgr.Path())
 	locks := txn.NewLockManager(0)
-	txns := txn.NewManager(locks)
+	txns := txn.NewManager(locks, log)
 	return &Database{
 		storage:  mgr,
 		catalog:  cat,
-		executor: exec.New(cat, mgr, idx, locks),
+		executor: exec.New(cat, mgr, idx, locks, log),
 		indexes:  idx,
 		locks:    locks,
 		txns:     txns,
+		wal:      log,
 		sessions: make(map[int64]*txn.Transaction),
 	}, nil
 }
@@ -64,6 +78,9 @@ func (db *Database) Close() error {
 	}
 	if db.indexes != nil {
 		_ = db.indexes.Close()
+	}
+	if db.wal != nil {
+		_ = db.wal.Close()
 	}
 	err := db.storage.Close()
 	db.storage = nil
