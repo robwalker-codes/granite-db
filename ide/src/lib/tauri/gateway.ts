@@ -102,12 +102,19 @@ function createMockEngine() {
             return { ok: false, error: "No database open" };
           }
           const payload = {
+            database: currentPath,
             tables: Array.from(tables.values()).map((table) => ({
               name: table.name,
               rowCount: table.rows.length,
-              columns: table.columns,
+              columns: table.columns.map((col) => ({
+                name: col.name,
+                type: col.type,
+                notNull: col.notNull,
+                default: null,
+                isPrimaryKey: col.pk
+              })),
               indexes: [],
-              fks: []
+              foreignKeys: []
             }))
           };
           return { ok: true, value: JSON.stringify(payload) as unknown as T };

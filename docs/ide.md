@@ -1,18 +1,18 @@
 # Granite IDE
 
-The Granite IDE is a cross-platform desktop companion for GraniteDB. It is built with Tauri, Vite, React, and TypeScript, and it talks directly to the engine by spawning `granitectl`. No HTTP server or external middleware is required.
+The Granite IDE is a desktop companion for GraniteDB. It is built with Tauri, Vite, React, and TypeScript, and it talks directly to the engine by spawning `granitectl`. This document summarises the setup, available features, and tips for day-to-day development.
 
-## Installation
+## Prerequisites
 
-> **Prerequisite:** Install Node.js 20 LTS (any version `>=20 <23`). Use `nvm` or your package manager to pin the version before installing dependencies.
+1. Install Node.js 20 LTS (`>=20 <23`). Tools such as `nvm` make switching versions simple.
+2. Build the engine so that `granitectl` is available. Either place the binary on your `PATH` or set the `GRANITECTL_PATH` environment variable before launching the IDE.
 
-1. Ensure the Go engine is built so that `granitectl` is available on your `PATH`. Alternatively, set the `GRANITECTL_PATH` environment variable to point to the executable before launching the IDE.
-2. Install the JavaScript dependencies:
+## Installing dependencies
 
-   ```bash
-   cd ide
-   npm install
-   ```
+```bash
+cd ide
+npm install
+```
 
 ## Running the IDE
 
@@ -22,7 +22,7 @@ The Granite IDE is a cross-platform desktop companion for GraniteDB. It is built
 npm run tauri dev
 ```
 
-This starts the Vite development server and launches the Tauri shell with live reload. Window size, position, theme, and the list of recently opened databases persist between runs via the Tauri store plugin.
+This command starts the Vite development server and launches the Tauri shell with live reload. Window state, theme, and the list of recently opened databases persist across sessions via the Tauri store plugin.
 
 ### Release build
 
@@ -32,70 +32,63 @@ npm run tauri build
 
 Tauri produces native bundles for macOS, Windows, and Linux.
 
-## Features
+## Core features
 
-* **File menu and recents** – open a `.gdb` database through the File → Open dialogue. The ten most recent databases are stored locally and shown in the drop-down on the toolbar.
-* **Schema explorer** – browse tables, columns, indexes, and foreign keys in the sidebar. Clicking a table injects `SELECT * FROM <table> LIMIT 100;` into the editor for quick inspection. The tree automatically refreshes after DDL and commits, and a Refresh button is available for manual sync after data changes.
-* **SQL editor** – Monaco provides SQL syntax highlighting, snippets, and keyboard shortcuts. Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (<kbd>⌘</kbd>+<kbd>Enter</kbd> on macOS) to execute and <kbd>Ctrl</kbd>+<kbd>L</kbd> (<kbd>⌘</kbd>+<kbd>L</kbd>) to run EXPLAIN. Errors appear inline beneath the editor and as toasts, with the session kept alive even when commands fail.
-* **Results grid** – the bottom pane renders query output with paging controls, copy-to-clipboard support, and row counts. CSV export is available from the toolbar and writes through the Rust/Tauri bridge for consistent formatting.
-* **Plan view** – EXPLAIN plans are visualised as expandable operator cards that surface key metadata such as join type, predicate, and index usage. The raw plan text appears above the interactive tree. See [docs/plan-json.md](./plan-json.md) for the JSON schema.
-* **Status bar** – displays the last action, row count, duration, active database path, and the current colour scheme. Opening a database shows a non-blocking progress indicator so the UI stays responsive.
-* **Theme toggle** – switch between light and dark styles from the toolbar. The preference is saved in the Tauri store, and Monaco adopts matching palettes instantly.
-* **Resilient engine bridge** – all Tauri invocations route through a gateway that converts failures into friendly toasts. App-wide error boundaries keep the shell rendered even if a command fails.
+* **File menu and recents** – open a `.gdb` database through the File → Open dialogue. The ten most recent databases are stored locally and exposed in the toolbar for quick access.
+* **Schema explorer** – powered by `granitectl meta --json`, the sidebar lists tables, columns, indexes, and foreign keys. Selecting a table injects `SELECT * FROM <table> LIMIT 100;` into the editor and the tree updates automatically after DDL statements.
+* **SQL editor** – Monaco provides SQL syntax highlighting, snippets, and keyboard shortcuts. Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (<kbd>⌘</kbd>+<kbd>Enter</kbd> on macOS) to run the current statement and <kbd>Ctrl</kbd>+<kbd>L</kbd> (<kbd>⌘</kbd>+<kbd>L</kbd>) to open an EXPLAIN plan. Errors surface as in-editor decorations and toast notifications so the session remains usable even after failures.
+* **Results grid** – query output is rendered with pagination, copy-to-clipboard support, and row counts. CSV export runs through the Tauri bridge for consistent formatting.
+* **Plan view** – EXPLAIN plans from `granitectl explain --json` appear as expandable operator cards that highlight join types, predicates, and index usage. See [docs/plan-json.md](./plan-json.md) for the payload schema.
+* **Status bar** – displays the last action, row count, duration, active database path, and the current theme. Long-running queries show a non-blocking spinner so the UI stays responsive.
+* **Theme toggle** – switch between light and dark modes from the toolbar. Preferences are saved via the store plugin and Monaco adopts the chosen palette immediately.
+* **Resilient engine bridge** – all Tauri invocations route through a gateway that converts failures into friendly errors. The schema explorer guards against malformed responses so unexpected CLI output no longer blanks the UI.
 
 ## CSV export
 
-Exports are streamed via `granitectl exec --format csv`. Choose “Export CSV” on the toolbar, pick a destination, and the IDE will materialise the file locally. The status bar confirms the target path once the operation completes.
+Exports stream through `granitectl exec --format csv`. Choose “Export CSV” on the toolbar, provide a destination, and the IDE writes the file locally. The status bar confirms completion once the operation finishes.
 
 ## JSON execution and metadata
 
-The IDE relies on the enhanced CLI support added in Stage 8:
+The IDE relies on three JSON endpoints provided by `granitectl`:
 
-* `granitectl exec --format json -q "…"` returns machine-readable result sets for the grid.
-* `granitectl meta --json <dbfile>` produces the schema explorer payload.
-* `granitectl explain --json -q "…"` emits the Stage 7 plan JSON for the visualiser.
-
-These commands are surfaced through the Tauri command handlers; the IDE validates inputs and enforces a 60-second timeout so runaway queries can be interrupted cleanly.
+* `granitectl exec --format json -q "…"` – returns machine-readable result sets for the grid.
+* `granitectl meta --json <dbfile>` – produces the schema explorer payload shown above.
+* `granitectl explain --json -q "…"` – emits plan JSON for the visualiser.
 
 ## Keyboard shortcuts
 
 * <kbd>Ctrl</kbd>+<kbd>Enter</kbd> / <kbd>⌘</kbd>+<kbd>Enter</kbd> – execute the current selection or the entire editor contents.
-* <kbd>Ctrl</kbd>+<kbd>L</kbd> / <kbd>⌘</kbd>+<kbd>L</kbd> – run EXPLAIN and show the plan view.
-* <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> – toggle the command palette provided by Monaco (useful for additional editor commands).
-
-## Changelog
-
-* 2025-10-23 – Migrated the desktop shell to Tauri v2, introduced explicit capability files, and standardised on Node.js 20 LTS for local development.
+* <kbd>Ctrl</kbd>+<kbd>L</kbd> / <kbd>⌘</kbd>+<kbd>L</kbd> – run EXPLAIN and display the plan view.
+* <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> – open Monaco’s command palette for additional editor commands.
 
 ## Troubleshooting
 
-* If the IDE cannot find `granitectl`, set `GRANITECTL_PATH` or ensure the binary is on the system `PATH` before launching.
-  * The toolbar shows a banner when the binary cannot be resolved. Run `go build ./...` from `engine` to produce it locally or point `GRANITECTL_PATH` to an existing build.
-* Queries that run for longer than 60 seconds are terminated and reported as timeouts; adjust the SQL and re-run.
-* Window layout, theme, and recents are stored in `granite-ide.settings.dat` within the Tauri store. Delete the file to reset the session state if necessary.
+* If the IDE cannot find `granitectl`, set `GRANITECTL_PATH` or ensure the binary is on the system `PATH` before launching. The toolbar shows a banner when resolution fails.
+* Queries running longer than 60 seconds are terminated and reported as timeouts. Optimise the SQL and retry.
+* Window layout, theme, and recents live in `granite-ide.settings.dat` within the Tauri store. Delete the file to reset the session state if necessary.
 
-## Testing
+## Testing the IDE
 
 ```bash
 cd ide
-npm run test    # Vitest unit coverage for stores, theming, and query helpers
-npm run e2e     # Playwright runs against the mock engine (VITE_ENABLE_E2E_MOCKS=true)
+npm run test    # Vitest unit tests
+npm run e2e     # Playwright suite using the mock engine (set VITE_ENABLE_E2E_MOCKS=true)
 ```
 
-The Playwright suite opens a mock database, exercises schema refresh behaviour, verifies dark mode integration with Monaco, and asserts that failed engine calls surface error toasts without blanking the window.
+The Playwright suite opens a mock database, exercises schema refresh behaviour, checks dark mode integration with Monaco, and asserts that failed engine calls produce toasts rather than blanking the window.
 
-## Post-change validation
+## Manual validation checklist
 
 ```bash
-# From repo root
+# From the repository root
 cd ide
 npm install
-npm run dev      # Vite prints:  http://localhost:5173/
+npm run dev      # Vite serves the frontend on http://localhost:5173/
 npm run tauri dev
-# Expect:
-# - Tauri validates config (no schema errors)
-# - It launches the window and loads the Vite app
-# - File Open/Save dialogs work (no permission errors)
-# - Settings persist (store/window-state work)
-# - Clipboard copy works if used
+# Confirm:
+# - Tauri validates its configuration without warnings.
+# - The window launches and renders the Vite app.
+# - File Open/Save dialogues operate correctly.
+# - Settings persist between sessions.
+# - Clipboard copy works where expected.
 ```

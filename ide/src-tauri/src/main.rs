@@ -225,7 +225,22 @@ fn metadata(path: String) -> Result<String, String> {
         .to_str()
         .ok_or_else(|| "Database path contains unsupported characters".to_string())?;
     match run_granitectl(&["meta", "--json", db]) {
-        Ok(output) => Ok(output.stdout),
+        Ok(output) => {
+            if !looks_like_json(&output.stdout) {
+                let preview = output.stdout.trim();
+                if preview.contains("unknown command") {
+                    let legacy = legacy_metadata(db)?;
+                    return Ok(legacy);
+                }
+                let message = if preview.is_empty() {
+                    "granitectl returned no metadata".to_string()
+                } else {
+                    format!("granitectl metadata output was not JSON: {preview}")
+                };
+                return Err(message);
+            }
+            Ok(output.stdout)
+        }
         Err(err) => {
             if err.contains("unknown command") {
                 let legacy = legacy_metadata(db)?;
@@ -261,6 +276,7 @@ fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
     command.args(args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    log_granitectl_debug(&path, args);
     let mut child = command.spawn().map_err(|err| match err.kind() {
         ErrorKind::NotFound => missing_granitectl_message(&path, source),
         _ => format!("Failed to run granitectl: {err}"),
@@ -293,6 +309,27 @@ fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
     }
 
     Ok(CommandOutput { stdout, stderr })
+}
+
+fn looks_like_json(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    matches!(trimmed.chars().next(), Some('{') | Some('['))
+}
+
+fn log_granitectl_debug(path: &Path, args: &[&str]) {
+    #[cfg(debug_assertions)]
+    {
+        let joined = if args.is_empty() {
+            String::new()
+        } else {
+            args.join(" ")
+        };
+        println!(
+            "[granitectl][debug] invoking {} {}",
+            path.display(),
+            joined
+        );
+    }
 }
 
 fn granitectl_resolution() -> (PathBuf, GraniteCtlSource) {

@@ -11,7 +11,7 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ metadata, search, onSearchChange, onSelectTable, onRefresh, refreshing }: SidebarProps) {
-  const tables = metadata?.tables ?? [];
+  const tables = Array.isArray(metadata?.tables) ? metadata.tables : [];
   const filtered = useMemo(() => {
     if (!search) {
       return tables;
@@ -70,7 +70,7 @@ export default function Sidebar({ metadata, search, onSearchChange, onSelectTabl
                   <li key={col.name}>
                     <span className="font-medium text-slate-600 dark:text-slate-300">{col.name}</span>
                     <span className="ml-1 text-slate-400">{col.type}</span>
-                    {col.pk && <span className="ml-1 text-amber-500">PK</span>}
+                    {col.isPrimaryKey && <span className="ml-1 text-amber-500">PK</span>}
                     {col.notNull && <span className="ml-1 text-emerald-500">NOT NULL</span>}
                   </li>
                 ))}
@@ -84,20 +84,26 @@ export default function Sidebar({ metadata, search, onSearchChange, onSelectTabl
                         <span className="font-medium text-slate-600 dark:text-slate-300">{idx.name}</span>
                         <span className="ml-1 text-slate-400">({idx.columns.join(", ")})</span>
                         {idx.unique && <span className="ml-1 text-emerald-500">UNIQUE</span>}
+                        {idx.type && <span className="ml-1 text-slate-400">[{idx.type}]</span>}
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
-              {table.fks.length > 0 && (
+              {table.foreignKeys.length > 0 && (
                 <div className="mt-2">
                   <p className="uppercase tracking-wide text-slate-400 dark:text-slate-500">Constraints</p>
                   <ul className="space-y-0.5">
-                    {table.fks.map((fk) => (
+                    {table.foreignKeys.map((fk) => (
                       <li key={fk.name}>
                         <span className="font-medium text-slate-600 dark:text-slate-300">{fk.name}</span>
                         <span className="ml-1 text-slate-400">
-                          {fk.columns.join(", ")} → {fk.refTable}({fk.refColumns.join(", ")})
+                          {fk.fromColumns.join(", ")} → {fk.toTable}({fk.toColumns.join(", ")})
+                          {(fk.onDelete || fk.onUpdate) && (
+                            <span className="ml-1 text-slate-400">
+                              [ON DELETE {fk.onDelete || "RESTRICT"}, ON UPDATE {fk.onUpdate || "RESTRICT"}]
+                            </span>
+                          )}
                         </span>
                       </li>
                     ))}

@@ -106,20 +106,12 @@ func TestMetadataJSONReflectsSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MetadataJSON: %v", err)
 	}
-	var payload struct {
-		Tables []struct {
-			Name    string `json:"name"`
-			Columns []struct {
-				Name string `json:"name"`
-				Type string `json:"type"`
-			} `json:"columns"`
-			Indexes []struct {
-				Name string `json:"name"`
-			} `json:"indexes"`
-		} `json:"tables"`
-	}
+	var payload api.DatabaseMeta
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Database == "" {
+		t.Fatalf("expected database path in payload")
 	}
 	if len(payload.Tables) != 1 {
 		t.Fatalf("expected 1 table, got %d", len(payload.Tables))
@@ -131,8 +123,8 @@ func TestMetadataJSONReflectsSchema(t *testing.T) {
 	if len(table.Columns) != 2 {
 		t.Fatalf("expected 2 columns, got %d", len(table.Columns))
 	}
-	if table.Columns[0].Type == "" {
-		t.Fatalf("expected column type to be populated")
+	if !table.Columns[0].IsPrimaryKey {
+		t.Fatalf("expected primary key to be flagged")
 	}
 	if len(table.Indexes) != 1 || table.Indexes[0].Name != "idx_customers_name" {
 		t.Fatalf("unexpected indexes: %v", table.Indexes)
