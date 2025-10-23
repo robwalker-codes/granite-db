@@ -4,6 +4,6 @@
   "description": "Allow copying query results to the system clipboard.",
   "windows": ["main"],
   "permissions": [
-    "clipboard:write-text"
+    "clipboard-manager:allow-write-text"
   ]
 }
