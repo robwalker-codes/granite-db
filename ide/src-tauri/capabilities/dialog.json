@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/capability.json",
+  "identifier": "dialog",
+  "description": "Allow the main window to show file open/save dialogues.",
+  "windows": ["main"],
+  "permissions": [
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
+}

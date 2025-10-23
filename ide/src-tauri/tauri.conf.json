@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Granite IDE",
+  "version": "0.1.0",
+  "identifier": "com.example.granite.ide",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": null,
+      "capabilities": [
+        "capabilities/core.json",
+        "capabilities/dialog.json",
+        "capabilities/fs.json",
+        "capabilities/clipboard.json",
+        "capabilities/store.json",
+        "capabilities/window-state.json"
+      ]
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Granite IDE",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  },
+  "plugins": {
+    "store": {
+      "defaults": {}
+    },
+    "window-state": {}
+  }
+}

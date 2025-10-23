@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/capability.json",
+  "identifier": "clipboard",
+  "description": "Allow copying query results to the system clipboard.",
+  "windows": ["main"],
+  "permissions": [
+    "clipboard:write-text"
+  ]
+}
