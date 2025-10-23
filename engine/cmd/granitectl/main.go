@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -43,7 +44,7 @@ func usage() {
 	fmt.Println("  granitectl new <dbfile>")
 	fmt.Println("  granitectl exec [-q <SQL> | -f <file.sql>] [--format table|csv] [--continue-on-error] <dbfile>")
 	fmt.Println("  granitectl dump <dbfile>")
-	fmt.Println("  granitectl explain -q <SQL> <dbfile>")
+	fmt.Println("  granitectl explain -q <SQL> [--json] [--out <file>] <dbfile>")
 }
 
 func runNew(args []string) {
@@ -181,8 +182,10 @@ func runDump(args []string) {
 func runExplain(args []string) {
 	fs := flag.NewFlagSet("explain", flag.ExitOnError)
 	query := fs.String("q", "", "SQL query to explain")
+	jsonOnly := fs.Bool("json", false, "Output plan as JSON only")
+	outPath := fs.String("out", "", "Write JSON plan to the specified file")
 	fs.Usage = func() {
-		fmt.Println("Usage: granitectl explain -q <SQL> <dbfile>")
+		fmt.Println("Usage: granitectl explain -q <SQL> [--json] [--out <file>] <dbfile>")
 	}
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -200,13 +203,34 @@ func runExplain(args []string) {
 	}
 	defer db.Close()
 
-	plan, err := db.Explain(*query)
+	var plan *exec.Plan
+	if !*jsonOnly {
+		plan, err = db.Explain(*query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	jsonData, err := db.ExplainJSON(*query)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if *outPath != "" {
+		if err := os.WriteFile(*outPath, jsonData, 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if *jsonOnly {
+		if err := printJSON(jsonData); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	prettyPrintPlan(plan.Root, 0)
-	if err := renderPlanJSON(plan); err != nil {
+	if err := renderPlanJSON(jsonData); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -367,15 +391,29 @@ func prettyPrintPlan(node *exec.PlanNode, depth int) {
 	}
 }
 
-func renderPlanJSON(plan *exec.Plan) error {
-	if plan == nil {
-		return fmt.Errorf("no plan to render")
-	}
-	data, err := json.MarshalIndent(plan, "", "  ")
+func renderPlanJSON(data []byte) error {
+	pretty, err := indentJSON(data)
 	if err != nil {
 		return err
 	}
 	fmt.Println("\nPlan JSON:")
-	fmt.Println(string(data))
+	fmt.Println(pretty)
 	return nil
+}
+
+func printJSON(data []byte) error {
+	pretty, err := indentJSON(data)
+	if err != nil {
+		return err
+	}
+	fmt.Println(pretty)
+	return nil
+}
+
+func indentJSON(data []byte) (string, error) {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, data, "", "  "); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }

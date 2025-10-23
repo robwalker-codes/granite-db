@@ -135,6 +135,14 @@ cd engine
 ./granitectl explain -q "SELECT * FROM people;" demo.gdb
 ```
 
+Add `--json` to emit only the serialised plan. Pair it with `--out` to persist the payload for tooling. The schema is documented in [docs/plan-json.md](docs/plan-json.md).
+
+```bash
+cd engine
+./granitectl explain --json -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
+./granitectl explain --json --out plan.json -q "SELECT * FROM orders WHERE total > 50 ORDER BY total LIMIT 1;" demo.gdb
+```
+
 ## Features
 
 * 4 KB slotted pages with a freelist allocator.
