@@ -40,6 +40,13 @@ export default function SqlEditor({ value, onChange, onRun, onExplain, theme, er
     };
   }, [monaco, onExplain, onRun]);
 
+  useEffect(() => {
+    if (!monaco) {
+      return;
+    }
+    monaco.editor.setTheme(theme === "dark" ? "vs-dark" : "vs");
+  }, [monaco, theme]);
+
   const handleChange: OnChange = useCallback((nextValue) => {
     onChange(nextValue ?? "");
   }, [onChange]);
@@ -53,7 +60,7 @@ export default function SqlEditor({ value, onChange, onRun, onExplain, theme, er
           value={value}
           onMount={handleMount}
           onChange={handleChange}
-          theme={theme === "dark" ? "vs-dark" : "light"}
+          theme={theme === "dark" ? "vs-dark" : "vs"}
           options={{
             minimap: { enabled: false },
             fontSize: 14,
