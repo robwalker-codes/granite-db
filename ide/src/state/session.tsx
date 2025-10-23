@@ -2,8 +2,9 @@ import { Store } from "@tauri-apps/plugin-store";
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { DatabaseMetadata, QueryResult } from "./db";
 import type { ExplainPayload } from "../lib/planTypes";
-
-type Theme = "light" | "dark";
+import { fetchGraniteCtlInfo, type GraniteCtlInfo as EngineInfo } from "../lib/engine/info";
+import { resolveGraniteCtlPath } from "../lib/engine/paths";
+import { initialiseTheme, setTheme as updateTheme, subscribe as subscribeToTheme, type Theme } from "./theme/ThemeService";
 
 export interface SessionState {
   ready: boolean;
@@ -17,9 +18,11 @@ export interface SessionState {
   lastDurationMs: number | null;
   rowCount: number | null;
   isRunning: boolean;
+  isOpening: boolean;
   theme: Theme;
   activePanel: "results" | "plan";
   error: string | null;
+  engineInfo: EngineInfo | null;
 }
 
 interface SessionContextValue {
@@ -33,9 +36,11 @@ interface SessionContextValue {
   setEditorText(value: string): void;
   setStatus(message: string | null, durationMs: number | null, rowCount: number | null): void;
   setRunning(running: boolean): void;
+  setOpening(opening: boolean): void;
   setTheme(theme: Theme): Promise<void>;
   setActivePanel(panel: "results" | "plan"): void;
   setError(message: string | null): void;
+  setEngineInfo(info: EngineInfo | null): void;
 }
 
 const defaultState: SessionState = {
@@ -50,49 +55,85 @@ const defaultState: SessionState = {
   lastDurationMs: null,
   rowCount: null,
   isRunning: false,
+  isOpening: false,
   theme: "light",
   activePanel: "results",
-  error: null
+  error: null,
+  engineInfo: null
 };
 
 const SessionContext = createContext<SessionContextValue | undefined>(undefined);
 
 const settingsStore = new Store("granite-ide.settings.dat");
 
-function applyTheme(theme: Theme) {
-  if (typeof document === "undefined") {
-    return;
-  }
-  const root = document.documentElement;
-  if (theme === "dark") {
-    root.classList.add("dark");
-  } else {
-    root.classList.remove("dark");
-  }
-}
-
 export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [state, setState] = useState<SessionState>(defaultState);
 
   useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
     async function load() {
-      const [recent, theme] = await Promise.all([
-        settingsStore.get<string[]>("recentFiles"),
-        settingsStore.get<Theme>("theme")
-      ]);
-      const nextTheme: Theme = theme === "dark" ? "dark" : "light";
-      applyTheme(nextTheme);
-      setState((prev) => ({
-        ...prev,
-        ready: true,
-        recentFiles: recent ?? [],
-        theme: nextTheme
-      }));
+      try {
+        const [recent, theme] = await Promise.all([
+          settingsStore.get<string[]>("recentFiles"),
+          initialiseTheme()
+        ]);
+        setState((prev) => ({
+          ...prev,
+          ready: true,
+          recentFiles: recent ?? [],
+          theme
+        }));
+      } catch (error) {
+        console.error("Failed to initialise session", error);
+        setState((prev) => ({ ...prev, ready: true }));
+      } finally {
+        unsubscribe = subscribeToTheme((theme) => {
+          setState((prev) => ({ ...prev, theme }));
+        });
+      }
     }
-    load().catch((err) => {
-      console.error("Failed to load session store", err);
-      setState((prev) => ({ ...prev, ready: true }));
+
+    load().catch((error) => {
+      console.error("Failed to initialise session", error);
     });
+
+    return () => {
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function verify() {
+      const info = await fetchGraniteCtlInfo();
+      if (cancelled) {
+        return;
+      }
+      if (info.ok) {
+        setState((prev) => ({ ...prev, engineInfo: info.value }));
+      } else {
+        console.error("[Engine] Failed to verify granitectl", info.error);
+        setState((prev) => ({
+          ...prev,
+          engineInfo: {
+            path: resolveGraniteCtlPath(),
+            source: "unverified",
+            exists: false,
+            error: info.error
+          }
+        }));
+      }
+    }
+
+    verify().catch((error) => {
+      console.error("[Engine] Verification threw", error);
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const setDbPath = useCallback((path: string | null) => {
@@ -143,10 +184,12 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setState((prev) => ({ ...prev, isRunning: running }));
   }, []);
 
+  const setOpening = useCallback((opening: boolean) => {
+    setState((prev) => ({ ...prev, isOpening: opening }));
+  }, []);
+
   const setTheme = useCallback(async (theme: Theme) => {
-    applyTheme(theme);
-    await settingsStore.set("theme", theme);
-    await settingsStore.save();
+    await updateTheme(theme);
     setState((prev) => ({ ...prev, theme }));
   }, []);
 
@@ -156,6 +199,10 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const setError = useCallback((message: string | null) => {
     setState((prev) => ({ ...prev, error: message }));
+  }, []);
+
+  const setEngineInfo = useCallback((info: EngineInfo | null) => {
+    setState((prev) => ({ ...prev, engineInfo: info }));
   }, []);
 
   const value = useMemo<SessionContextValue>(
@@ -170,11 +217,29 @@ export const SessionProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setEditorText,
       setStatus,
       setRunning,
+      setOpening,
       setTheme,
       setActivePanel,
-      setError
+      setError,
+      setEngineInfo
     }),
-    [state, setDbPath, setRecentFiles, addRecentPath, setMetadata, setResult, setPlan, setEditorText, setStatus, setRunning, setTheme, setActivePanel, setError]
+    [
+      state,
+      setDbPath,
+      setRecentFiles,
+      addRecentPath,
+      setMetadata,
+      setResult,
+      setPlan,
+      setEditorText,
+      setStatus,
+      setRunning,
+      setOpening,
+      setTheme,
+      setActivePanel,
+      setError,
+      setEngineInfo
+    ]
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;

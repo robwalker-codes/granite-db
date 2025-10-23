@@ -35,12 +35,13 @@ Tauri produces native bundles for macOS, Windows, and Linux.
 ## Features
 
 * **File menu and recents** – open a `.gdb` database through the File → Open dialogue. The ten most recent databases are stored locally and shown in the drop-down on the toolbar.
-* **Schema explorer** – browse tables, columns, indexes, and foreign keys in the sidebar. Clicking a table injects `SELECT * FROM <table> LIMIT 100;` into the editor for quick inspection.
-* **SQL editor** – Monaco provides SQL syntax highlighting, snippets, and keyboard shortcuts. Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (<kbd>⌘</kbd>+<kbd>Enter</kbd> on macOS) to execute and <kbd>Ctrl</kbd>+<kbd>L</kbd> (<kbd>⌘</kbd>+<kbd>L</kbd>) to run EXPLAIN. Errors appear inline beneath the editor and as toasts.
+* **Schema explorer** – browse tables, columns, indexes, and foreign keys in the sidebar. Clicking a table injects `SELECT * FROM <table> LIMIT 100;` into the editor for quick inspection. The tree automatically refreshes after DDL and commits, and a Refresh button is available for manual sync after data changes.
+* **SQL editor** – Monaco provides SQL syntax highlighting, snippets, and keyboard shortcuts. Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (<kbd>⌘</kbd>+<kbd>Enter</kbd> on macOS) to execute and <kbd>Ctrl</kbd>+<kbd>L</kbd> (<kbd>⌘</kbd>+<kbd>L</kbd>) to run EXPLAIN. Errors appear inline beneath the editor and as toasts, with the session kept alive even when commands fail.
 * **Results grid** – the bottom pane renders query output with paging controls, copy-to-clipboard support, and row counts. CSV export is available from the toolbar and writes through the Rust/Tauri bridge for consistent formatting.
 * **Plan view** – EXPLAIN plans are visualised as expandable operator cards that surface key metadata such as join type, predicate, and index usage. The raw plan text appears above the interactive tree. See [docs/plan-json.md](./plan-json.md) for the JSON schema.
-* **Status bar** – displays the last action, row count, duration, active database path, and the current colour scheme.
-* **Theme toggle** – switch between light and dark styles from the toolbar. The preference is saved in the Tauri store.
+* **Status bar** – displays the last action, row count, duration, active database path, and the current colour scheme. Opening a database shows a non-blocking progress indicator so the UI stays responsive.
+* **Theme toggle** – switch between light and dark styles from the toolbar. The preference is saved in the Tauri store, and Monaco adopts matching palettes instantly.
+* **Resilient engine bridge** – all Tauri invocations route through a gateway that converts failures into friendly toasts. App-wide error boundaries keep the shell rendered even if a command fails.
 
 ## CSV export
 
@@ -69,8 +70,19 @@ These commands are surfaced through the Tauri command handlers; the IDE validate
 ## Troubleshooting
 
 * If the IDE cannot find `granitectl`, set `GRANITECTL_PATH` or ensure the binary is on the system `PATH` before launching.
+  * The toolbar shows a banner when the binary cannot be resolved. Run `go build ./...` from `engine` to produce it locally or point `GRANITECTL_PATH` to an existing build.
 * Queries that run for longer than 60 seconds are terminated and reported as timeouts; adjust the SQL and re-run.
 * Window layout, theme, and recents are stored in `granite-ide.settings.dat` within the Tauri store. Delete the file to reset the session state if necessary.
+
+## Testing
+
+```bash
+cd ide
+npm run test    # Vitest unit coverage for stores, theming, and query helpers
+npm run e2e     # Playwright runs against the mock engine (VITE_ENABLE_E2E_MOCKS=true)
+```
+
+The Playwright suite opens a mock database, exercises schema refresh behaviour, verifies dark mode integration with Monaco, and asserts that failed engine calls surface error toasts without blanking the window.
 
 ## Post-change validation
 

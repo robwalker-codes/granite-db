@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -35,6 +36,83 @@ struct ExecResponse {
 struct CommandOutput {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+enum GraniteCtlSource {
+    Environment,
+    Default,
+    System,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraniteCtlInfo {
+    path: String,
+    exists: bool,
+    source: GraniteCtlSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+static GRANITECTL_LOG: OnceLock<()> = OnceLock::new();
+
+#[tauri::command]
+fn granitectl_info() -> Result<GraniteCtlInfo, String> {
+    let (path, source) = granitectl_resolution();
+    log_granitectl_resolution(&path, source);
+    let path_string = path.to_string_lossy().into_owned();
+    let mut exists = false;
+    let mut version = None;
+    let mut error = None;
+
+    match source {
+        GraniteCtlSource::Environment | GraniteCtlSource::Default => {
+            exists = path.exists();
+            if exists {
+                match Command::new(&path).arg("--version").output() {
+                    Ok(output) => {
+                        let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !ver.is_empty() {
+                            version = Some(ver);
+                        }
+                    }
+                    Err(err) => {
+                        error = Some(format!("Failed to run granitectl --version: {err}"));
+                    }
+                }
+            } else {
+                error = Some(missing_granitectl_message(&path, source));
+            }
+        }
+        GraniteCtlSource::System => match Command::new(&path).arg("--version").output() {
+            Ok(output) => {
+                exists = true;
+                let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !ver.is_empty() {
+                    version = Some(ver);
+                }
+            }
+            Err(err) => {
+                if err.kind() == ErrorKind::NotFound {
+                    error = Some(missing_granitectl_message(&path, source));
+                } else {
+                    error = Some(format!("Failed to run granitectl --version: {err}"));
+                }
+            }
+        },
+    }
+
+    Ok(GraniteCtlInfo {
+        path: path_string,
+        exists,
+        source,
+        version,
+        error,
+    })
 }
 
 #[tauri::command]
@@ -173,13 +251,21 @@ fn export_csv(path: String, sql: String, out_path: String) -> Result<(), String>
 }
 
 fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
-    let mut command = Command::new(granitectl_path());
+    let (path, source) = granitectl_resolution();
+    log_granitectl_resolution(&path, source);
+    if !matches!(source, GraniteCtlSource::System) && !path.exists() {
+        return Err(missing_granitectl_message(&path, source));
+    }
+
+    let mut command = Command::new(&path);
     command.args(args);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("Failed to run granitectl: {err}"))?;
+    let mut child = command.spawn().map_err(|err| match err.kind() {
+        ErrorKind::NotFound => missing_granitectl_message(&path, source),
+        _ => format!("Failed to run granitectl: {err}"),
+    })?;
+
     match child.wait_timeout(QUERY_TIMEOUT) {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -191,6 +277,7 @@ fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
             return Err(format!("Failed to await granitectl: {err}"));
         }
     }
+
     let output = child
         .wait_with_output()
         .map_err(|err| format!("Failed to read granitectl output: {err}"))?;
@@ -204,29 +291,57 @@ fn run_granitectl(args: &[&str]) -> Result<CommandOutput, String> {
         };
         return Err(err_msg);
     }
+
     Ok(CommandOutput { stdout, stderr })
 }
 
-fn granitectl_path() -> OsString {
+fn granitectl_resolution() -> (PathBuf, GraniteCtlSource) {
     if let Some(path) = std::env::var_os("GRANITECTL_PATH") {
         if !path.is_empty() {
-            return path;
+            return (PathBuf::from(path), GraniteCtlSource::Environment);
         }
     }
 
     let exe_name = format!("granitectl{}", std::env::consts::EXE_SUFFIX);
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
-            for ancestor in parent.ancestors() {
-                let candidate = ancestor.join("engine").join(&exe_name);
-                if candidate.exists() {
-                    return candidate.into_os_string();
-                }
-            }
+            let candidate = parent.join("..").join("engine").join(&exe_name);
+            return (candidate, GraniteCtlSource::Default);
         }
     }
 
-    OsString::from("granitectl")
+    (PathBuf::from(exe_name), GraniteCtlSource::System)
+}
+
+fn missing_granitectl_message(path: &Path, source: GraniteCtlSource) -> String {
+    match source {
+        GraniteCtlSource::Environment => format!(
+            "granitectl executable not found at {}. Update GRANITECTL_PATH or build the engine.",
+            path.display()
+        ),
+        GraniteCtlSource::Default => format!(
+            "granitectl executable not found at {}. Build the engine or set GRANITECTL_PATH.",
+            path.display()
+        ),
+        GraniteCtlSource::System => {
+            "granitectl executable was not found on PATH. Build the engine or set GRANITECTL_PATH.".into()
+        }
+    }
+}
+
+fn log_granitectl_resolution(path: &Path, source: GraniteCtlSource) {
+    GRANITECTL_LOG.get_or_init(|| {
+        let source_label = match source {
+            GraniteCtlSource::Environment => "environment variable",
+            GraniteCtlSource::Default => "default build path",
+            GraniteCtlSource::System => "system PATH",
+        };
+        let display = path
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        println!("[granitectl] resolved via {source_label}: {display}");
+    });
 }
 
 fn is_unknown_format_error(message: &str) -> bool {
@@ -761,6 +876,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
+            granitectl_info,
             open_db,
             create_db,
             exec_sql,
