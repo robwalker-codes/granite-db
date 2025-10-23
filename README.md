@@ -1,8 +1,14 @@
 # GraniteDB
 
-GraniteDB is a compact relational core implemented in Go. It focuses on the fundamentals of page-based storage, a tiny SQL surface, and a clean modular design. Stage 6 introduces explicit transactions, Read Committed isolation, and a lock manager alongside the existing indexing, constraint, grouping, aggregation, and ordering features.
+GraniteDB is a compact relational database engine written in Go with a cross-platform desktop IDE built on Tauri and React. The project is designed to be easy to build locally, explore, and extend. This guide introduces the main components, shows how to get them running, and highlights the most important commands for day-to-day work.
 
-## Quick start
+## Repository layout
+
+* `engine/` – the Go-based storage engine, planner, and the `granitectl` command-line client.
+* `ide/` – the Tauri desktop IDE that wraps `granitectl` and presents an editor, schema explorer, and result visualisations.
+* `docs/` – reference material for the IDE and JSON payloads.
+
+## Building the engine
 
 GraniteDB requires Go 1.21 or newer.
 
@@ -11,13 +17,52 @@ cd engine
 go build ./...
 ```
 
-## Granite IDE
+This produces the `granitectl` binary in the `engine/` directory. Point the IDE at this binary via the `GRANITECTL_PATH` environment variable if it is not on your `PATH`.
 
-Stage 8 introduces a cross-platform desktop IDE built with Tauri, React, and TypeScript. The IDE talks directly to the engine via `granitectl`, exposing a schema explorer, Monaco-powered SQL editor, results grid, CSV export, and a visual EXPLAIN plan viewer. Settings such as recent databases and theme preference are persisted using the Tauri store plugin.
+### Creating and inspecting a database
 
-### Development workflow
+```bash
+cd engine
+./granitectl new demo.gdb
+./granitectl exec -q "CREATE TABLE people(id INT PRIMARY KEY, name VARCHAR(50));" demo.gdb
+./granitectl exec -q "INSERT INTO people VALUES (1, 'Ada'), (2, 'Grace');" demo.gdb
+./granitectl exec -q "SELECT * FROM people;" demo.gdb
+```
 
-> Requires Node.js 20 LTS (any version `>=20 <23`).
+The CLI supports several verbs:
+
+* `granitectl exec` – run ad-hoc SQL or scripts in table, CSV, or JSON format.
+* `granitectl dump` – print a human-readable schema report.
+* `granitectl explain` – emit textual and JSON execution plans.
+* `granitectl meta [--json] <dbfile>` – output the schema catalogue. Use `--json` for a stable machine-readable payload documented below.
+
+The `meta` JSON structure returned by the new command looks like:
+
+```json
+{
+  "database": "demo.gdb",
+  "tables": [
+    {
+      "name": "people",
+      "rowCount": 2,
+      "columns": [
+        { "name": "id", "type": "INT", "notNull": true, "default": null, "isPrimaryKey": true },
+        { "name": "name", "type": "VARCHAR(50)", "notNull": false, "default": null, "isPrimaryKey": false }
+      ],
+      "indexes": [
+        { "name": "pk_people", "unique": true, "columns": ["id"], "type": "BTREE" }
+      ],
+      "foreignKeys": []
+    }
+  ]
+}
+```
+
+Use this payload when integrating with external tools or the IDE.
+
+## Running the IDE
+
+The desktop IDE requires Node.js 20 LTS (`>=20 <23`).
 
 ```bash
 cd ide
@@ -25,193 +70,48 @@ npm install
 npm run tauri dev
 ```
 
-### Building a release bundle
+The development build launches Vite and the Tauri shell with live reload. The IDE discovers `granitectl` automatically when the engine has been built in `engine/`, or you can set `GRANITECTL_PATH` to an explicit executable.
+
+To produce native bundles for macOS, Windows, or Linux:
 
 ```bash
 cd ide
-npm install
 npm run tauri build
 ```
 
-The IDE usage guide, shortcuts, and feature tour live in [docs/ide.md](docs/ide.md).
+### Key IDE features
 
-### Creating a database
+* **Schema explorer** – powered by `granitectl meta --json`, showing tables, columns, indexes, and foreign keys.
+* **SQL editor** – Monaco-based editing with shortcuts for running queries and EXPLAIN plans.
+* **Results grid** – tabular display with CSV export and JSON-backed result handling.
+* **Plan view** – renders the JSON plan output from `granitectl explain --json`.
+* **Resilient engine bridge** – all calls to `granitectl` go through a guarded gateway that surfaces errors without freezing the UI.
 
-```bash
-cd engine
-./granitectl new demo.gdb
-```
-
-### Running commands
-
-```bash
-cd engine
-./granitectl exec -q "CREATE TABLE people(id INT NOT NULL, name VARCHAR(50), PRIMARY KEY(id));" demo.gdb
-./granitectl exec -q "INSERT INTO people(id, name) VALUES (1, 'Ada');" demo.gdb
-./granitectl exec -q "INSERT INTO people(id, name) VALUES (2, 'Grace');" demo.gdb
-./granitectl exec -q "SELECT * FROM people;" demo.gdb
-./granitectl exec -q "CREATE INDEX idx_people_name ON people(name);" demo.gdb
-./granitectl explain -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
-./granitectl exec --format json -q "SELECT * FROM people;" demo.gdb
-./granitectl meta --json demo.gdb
-```
-
-Foreign keys now protect parent/child relationships immediately:
-
-```bash
-cd engine
-./granitectl exec -q "CREATE TABLE customers(id INT PRIMARY KEY, name VARCHAR(50));" demo.gdb
-./granitectl exec -q "CREATE TABLE orders(id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE RESTRICT ON UPDATE RESTRICT);" demo.gdb
-./granitectl exec -q "INSERT INTO customers VALUES (1,'Ada');" demo.gdb
-./granitectl exec -q "INSERT INTO orders VALUES (100,1);" demo.gdb
-./granitectl exec -q "DELETE FROM customers WHERE id=1;" demo.gdb   # foreign key violation on "fk_orders_1": referenced by "orders" ...
-```
-
-The CLI surfaces friendly error messages when constraints are violated, making it easy to spot the offending key values.
-```
-
-Expected output:
-
-```
-id | name 
--- | -----
-1  | Ada  
-2  | Grace
-(2 row(s))
-```
-
-To inspect the schema, use:
-
-```bash
-cd engine
-./granitectl dump demo.gdb
-```
-
-Explicit transactions are now available and default to autocommit when not in use:
-
-```bash
-cd engine
-./granitectl exec -q "BEGIN; UPDATE orders SET total = total + 10 WHERE id = 100; COMMIT;" demo.gdb
-./granitectl exec -q "BEGIN; UPDATE orders SET total = total + 100 WHERE id = 100; ROLLBACK;" demo.gdb
-```
-
-Conflicting writers wait for the holder to finish before returning a clear error such as `lock timeout on table orders` once the two second timeout expires.
-
-## New in Stage 6
-
-Stage 6 introduces explicit transaction control and a lock manager that provides
-Read Committed isolation. Statements continue to run in autocommit mode unless
-wrapped by `BEGIN`/`COMMIT` or `ROLLBACK`. Conflicting readers and writers now
-wait on table and row locks, with clear timeout errors when contention persists.
-All previously shipped features, including secondary indexes and immediate
-foreign key enforcement, remain available. A few examples:
-
-```bash
-./granitectl exec -q "SELECT c.name, COUNT(o.id) AS orders, SUM(o.total) AS spend FROM customers c LEFT JOIN orders o ON c.id=o.customer_id GROUP BY c.name HAVING SUM(o.total) IS NOT NULL ORDER BY spend DESC, c.name ASC;" demo.gdb
-```
-
-```
-name | orders | spend
----- | ------ | -----
-Grace| 2      | 99.99
-Ada  | 2      | 49.75
-(2 row(s))
-```
-
-```bash
-./granitectl exec -q "SELECT customer_id, AVG(total) AS avg_total FROM orders GROUP BY customer_id ORDER BY customer_id;" demo.gdb
-./granitectl explain -q "SELECT * FROM orders WHERE total > 50;" demo.gdb
-```
-
-```
-customer_id | avg_total
------------ | ---------
-1           | 24.88
-2           | 99.99
-(2 row(s))
-```
-
-Expression projections, arithmetic, joins, and scalar functions from the
-previous stages remain available and continue to work without modification.
-
-### Running scripts
-
-You can execute a file containing semicolon-terminated statements. The runner stops at the first error by default, but the `--continue-on-error` flag keeps processing subsequent statements.
-
-```bash
-cd engine
-./granitectl exec -f ./seed.sql demo.gdb
-```
-
-### Exporting results
-
-For quick CSV exports, change the output format when running ad-hoc commands or scripts:
-
-```bash
-cd engine
-./granitectl exec -q "SELECT * FROM people;" --format csv demo.gdb
-```
-
-Use the JSON format when integrating with scripts and the IDE:
-
-```bash
-cd engine
-./granitectl exec --format json -q "SELECT id, name FROM people;" demo.gdb
-```
-
-### Explaining a query
-
-The `explain` verb prints a lightweight operator tree and JSON payload for integration with tooling.
-
-```bash
-cd engine
-./granitectl explain -q "SELECT * FROM people;" demo.gdb
-```
-
-Add `--json` to emit only the serialised plan. Pair it with `--out` to persist the payload for tooling. The schema is documented in [docs/plan-json.md](docs/plan-json.md).
-
-```bash
-cd engine
-./granitectl explain --json -q "SELECT * FROM people WHERE name = 'Ada';" demo.gdb
-./granitectl explain --json --out plan.json -q "SELECT * FROM orders WHERE total > 50 ORDER BY total LIMIT 1;" demo.gdb
-```
-
-## Features
-
-* 4 KB slotted pages with a freelist allocator.
-* Heap files for table storage with automatic page chaining.
-* System catalogue capturing table definitions, column metadata, row counts, and secondary indexes.
-* Minimal SQL subset (CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT with expression projections, filtering, grouping, aggregation, ordering, and joins).
-* Fixed-precision `DECIMAL` columns with precision/scale enforcement across inserts and scans.
-* B⁺-tree indexes shared by primary and secondary keys with optional uniqueness enforcement.
-* Cost-free planner heuristics that recognise equality and range predicates and choose index scans automatically.
-* Immediate foreign key enforcement with RESTRICT/NO ACTION behaviour for both column-level and table-level declarations.
-* Explicit transactions with Read Committed isolation, shared/exclusive table locks, row-level exclusive locks, and descriptive lock timeouts.
-* Write-ahead logging (REDO) underpinning transaction durability.
-* Command-line client for database lifecycle management, transaction-aware query execution, script running, CSV exports, and plan inspection.
-* Machine-readable JSON execution and metadata output for tooling integrations.
-* Cross-platform desktop IDE with schema explorer, SQL editor, results viewer, CSV export, and plan visualiser.
-
-## Current limitations
-
-* Joins are limited to left-deep chains of INNER and LEFT joins. No USING, RIGHT/FULL joins, or join reordering.
-* Isolation is limited to Read Committed and enforced via locking with timeout-based deadlock avoidance.
-* Single database file – no replication or clustering.
-* Foreign keys currently support only `RESTRICT`/`NO ACTION` referential actions. `CASCADE`, `SET NULL`, `SET DEFAULT`, and deferrable constraints are not yet available.
-* Only literal VALUES clauses are accepted in INSERT statements.
+Further IDE guidance lives in [docs/ide.md](docs/ide.md).
 
 ## Testing
+
+Engine tests:
 
 ```bash
 cd engine
 go test ./...
 ```
 
-## Roadmap
+IDE tests (Vitest and Playwright):
 
-Future work will focus on richer join strategies, index cost estimation,
-stronger isolation levels, and observability enhancements.
+```bash
+cd ide
+npm run test      # unit tests
+npm run e2e       # Playwright against the mock engine
+```
+
+## Contributing
+
+* Keep changes small and cohesive.
+* Run the Go and Node test suites relevant to your changes.
+* Use clear commit messages and UK English for documentation and comments.
 
 ## Licence
 
-GraniteDB is released under the Apache 2.0 Licence. See [LICENCE](LICENSE).
+GraniteDB is available under the Apache 2.0 licence. See [LICENCE](LICENSE) for details.

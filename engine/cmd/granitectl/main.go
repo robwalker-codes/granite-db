@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -260,87 +261,102 @@ func runExplain(args []string) {
 }
 
 func runMeta(args []string) {
-	fs := flag.NewFlagSet("meta", flag.ExitOnError)
-	jsonOnly := fs.Bool("json", false, "Output metadata as JSON")
-	fs.Usage = func() {
-		fmt.Println("Usage: granitectl meta [--json] <dbfile>")
-	}
-	fs.Parse(args)
-	if fs.NArg() != 1 {
-		fs.Usage()
-		os.Exit(1)
-	}
-	db, err := api.Open(fs.Arg(0))
+	jsonOut, dbPath, err := parseMetaArgs(args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if errors.Is(err, errMetaUsage) {
+			fmt.Fprintln(os.Stderr, "Usage: granitectl meta [--json] <dbfile>")
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stderr, "meta: %v\n", err)
+		os.Exit(2)
+	}
+
+	meta, err := api.LoadDatabaseMeta(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "meta: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
 
-	if *jsonOnly {
-		data, err := db.MetadataJSON()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		if err := printJSON(data); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(meta); err != nil {
+			fmt.Fprintf(os.Stderr, "meta: encode: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	tables, err := db.Tables()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	if len(tables) == 0 {
+	fmt.Printf("Database: %s\n", meta.Database)
+	if len(meta.Tables) == 0 {
 		fmt.Println("No tables defined")
 		return
 	}
-	for _, table := range tables {
-		fmt.Printf("Table %s (%d row(s))\n", table.Name, table.RowCount)
+	for _, table := range meta.Tables {
+		fmt.Printf("- %s (%d column(s), %d row(s))\n", table.Name, len(table.Columns), table.RowCount)
 		for _, col := range table.Columns {
-			fmt.Printf("  - %s %s", col.Name, describeType(col))
+			fmt.Printf("    • %s %s", col.Name, col.Type)
 			if col.NotNull {
 				fmt.Print(" NOT NULL")
 			}
-			if col.PrimaryKey {
+			if col.IsPrimaryKey {
 				fmt.Print(" PRIMARY KEY")
 			}
 			fmt.Println()
 		}
 		if len(table.Indexes) > 0 {
-			fmt.Println("  Indexes:")
-			names := make([]string, 0, len(table.Indexes))
-			for name := range table.Indexes {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				idx := table.Indexes[name]
-				fmt.Printf("    - %s (%s)", idx.Name, strings.Join(idx.Columns, ", "))
-				if idx.IsUnique {
+			fmt.Println("    Indexes:")
+			for _, idx := range table.Indexes {
+				fmt.Printf("      - %s (%s)", idx.Name, strings.Join(idx.Columns, ", "))
+				if idx.Unique {
 					fmt.Print(" UNIQUE")
+				}
+				if idx.Type != "" {
+					fmt.Printf(" [%s]", idx.Type)
 				}
 				fmt.Println()
 			}
 		}
 		if len(table.ForeignKeys) > 0 {
-			fmt.Println("  Foreign Keys:")
-			names := make([]string, 0, len(table.ForeignKeys))
-			for name := range table.ForeignKeys {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				fk := table.ForeignKeys[name]
-				fmt.Printf("    - %s (%s) REFERENCES %s(%s)\n", fk.Name, strings.Join(fk.ChildColumns, ", "), fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+			fmt.Println("    Foreign Keys:")
+			for _, fk := range table.ForeignKeys {
+				fmt.Printf("      - %s: %s → %s(%s)", fk.Name, strings.Join(fk.FromColumns, ", "), fk.ToTable, strings.Join(fk.ToColumns, ", "))
+				if fk.OnDelete != "" || fk.OnUpdate != "" {
+					fmt.Printf(" [ON DELETE %s, ON UPDATE %s]", fk.OnDelete, fk.OnUpdate)
+				}
+				fmt.Println()
 			}
 		}
-		fmt.Println()
 	}
+}
+
+var errMetaUsage = errors.New("meta usage")
+
+func parseMetaArgs(args []string) (bool, string, error) {
+	var (
+		jsonOut bool
+		dbPath  string
+	)
+	for _, arg := range args {
+		switch arg {
+		case "--json", "-json":
+			jsonOut = true
+		case "--help", "-h":
+			return false, "", errMetaUsage
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return false, "", fmt.Errorf("unknown option %s", arg)
+			}
+			if dbPath != "" {
+				return false, "", fmt.Errorf("multiple database paths provided")
+			}
+			dbPath = arg
+		}
+	}
+	if dbPath == "" {
+		return false, "", errMetaUsage
+	}
+	return jsonOut, dbPath, nil
 }
 
 func describeType(col catalog.Column) string {
