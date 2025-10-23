@@ -24,19 +24,25 @@ export default function SqlEditor({ value, onChange, onRun, onExplain, theme, er
     if (!editor || !monaco) {
       return;
     }
-    const runCommand = editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-      onRun(getSelectedText(editor));
+    const runAction = editor.addAction({
+      id: "granite-run-query",
+      label: "Run Query",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+      run: () => {
+        onRun(getSelectedText(editor));
+      }
     });
-    const explainCommand = editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => {
-      onExplain(getSelectedText(editor));
+    const explainAction = editor.addAction({
+      id: "granite-explain-query",
+      label: "Explain Query",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL],
+      run: () => {
+        onExplain(getSelectedText(editor));
+      }
     });
     return () => {
-      if (runCommand) {
-        editor.removeCommand(runCommand);
-      }
-      if (explainCommand) {
-        editor.removeCommand(explainCommand);
-      }
+      runAction.dispose();
+      explainAction.dispose();
     };
   }, [monaco, onExplain, onRun]);
 
