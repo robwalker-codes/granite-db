@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import type { ExplainPayload } from "../lib/planTypes";
+import { call, type Result } from "../lib/tauri/gateway";
 
 export interface DatabaseColumn {
   name: string;
@@ -41,42 +41,106 @@ export interface QueryResult {
   message?: string;
 }
 
-export interface ExecResponse {
+interface ExecResponse {
   format: "table" | "csv" | "jsonRows";
   output?: string;
   result?: QueryResult;
 }
 
-export async function createDatabase(path: string): Promise<void> {
-  await invoke("create_db", { path });
-}
-
-export async function openDatabase(path: string): Promise<void> {
-  await invoke("open_db", { path });
-}
-
-export async function executeQuery(path: string, sql: string): Promise<QueryResult> {
-  const response = await invoke<ExecResponse>("exec_sql", {
-    path,
-    sql,
-    format: "jsonRows"
-  });
-  if (!response || response.format !== "jsonRows" || !response.result) {
-    throw new Error("Unexpected response from engine");
+export async function createDatabase(path: string): Promise<Result<void>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
   }
-  return response.result;
+  return call("create_db", { path });
 }
 
-export async function explainQuery(path: string, sql: string): Promise<ExplainPayload> {
-  const payload = await invoke<string>("explain_sql", { path, sql });
-  return JSON.parse(payload) as ExplainPayload;
+export async function openDatabase(path: string): Promise<Result<void>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
+  }
+  return call("open_db", { path });
 }
 
-export async function fetchMetadata(path: string): Promise<DatabaseMetadata> {
-  const payload = await invoke<string>("metadata", { path });
-  return JSON.parse(payload) as DatabaseMetadata;
+export async function executeQuery(path: string, sql: string): Promise<Result<QueryResult>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
+  }
+  if (!sql.trim()) {
+    return { ok: false, error: "SQL must not be empty" };
+  }
+  const response = await call<ExecResponse>("exec_sql", { path, sql, format: "jsonRows" });
+  if (!response.ok) {
+    return response;
+  }
+  const payload = response.value;
+  if (!payload || payload.format !== "jsonRows" || !payload.result) {
+    return { ok: false, error: "Unexpected response from engine" };
+  }
+  return { ok: true, value: payload.result };
 }
 
-export async function exportCsv(path: string, sql: string, outPath: string): Promise<void> {
-  await invoke("export_csv", { path, sql, outPath });
+export async function explainQuery(path: string, sql: string): Promise<Result<ExplainPayload>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
+  }
+  if (!sql.trim()) {
+    return { ok: false, error: "SQL must not be empty" };
+  }
+  const response = await call<string>("explain_sql", { path, sql });
+  if (!response.ok) {
+    return response;
+  }
+  try {
+    return { ok: true, value: JSON.parse(response.value) as ExplainPayload };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Failed to parse explain plan: ${message}` };
+  }
+}
+
+export async function fetchMetadata(path: string): Promise<Result<DatabaseMetadata>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
+  }
+  console.log("[fetchMetadata] called with", path);
+  const response = await call<string>("metadata", { path });
+  if (!response.ok) {
+    return response;
+  }
+  try {
+    return { ok: true, value: JSON.parse(response.value) as DatabaseMetadata };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Failed to parse metadata: ${message}` };
+  }
+}
+
+export async function exportCsv(path: string, sql: string, outPath: string): Promise<Result<void>> {
+  if (!path) {
+    return { ok: false, error: "Database path is required" };
+  }
+  if (!sql.trim()) {
+    return { ok: false, error: "SQL must not be empty" };
+  }
+  if (!outPath) {
+    return { ok: false, error: "Export path is required" };
+  }
+  return call("export_csv", { path, sql, outPath });
+}
+
+export function isDdlStatement(sql: string): boolean {
+  const trimmed = sql.trim().toLowerCase();
+  if (!trimmed) {
+    return false;
+  }
+  const ddlPrefixes = ["create", "drop", "alter", "rename", "truncate"]; // conservative list
+  return ddlPrefixes.some((prefix) => trimmed.startsWith(prefix));
+}
+
+export function isCommitStatement(sql: string): boolean {
+  const trimmed = sql.trim().toLowerCase();
+  if (!trimmed) {
+    return false;
+  }
+  return trimmed === "commit" || trimmed.startsWith("commit;") || trimmed.startsWith("commit transaction");
 }

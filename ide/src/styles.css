@@ -2,6 +2,16 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --color-editor-bg: #ffffff;
+  --color-editor-foreground: #0f172a;
+  --color-editor-line-number: #475569;
+  --color-editor-selection: #bfdbfe;
+  --color-editor-highlight: #e2e8f0;
+  --color-editor-inactive-selection: #cbd5f54d;
+  --color-editor-cursor: #1f2937;
+}
+
 html,
 body,
 #root {
@@ -14,4 +24,14 @@ body {
 
 html.dark body {
   @apply bg-slate-900 text-slate-100;
+}
+
+html.dark {
+  --color-editor-bg: #0b0f14;
+  --color-editor-foreground: #e6edf3;
+  --color-editor-line-number: #8b949e;
+  --color-editor-selection: #264f78;
+  --color-editor-highlight: #1f293780;
+  --color-editor-inactive-selection: #1f293733;
+  --color-editor-cursor: #e6edf3;
 }

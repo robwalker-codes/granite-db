@@ -44,7 +44,43 @@ export default function SqlEditor({ value, onChange, onRun, onExplain, theme, er
     if (!monaco) {
       return;
     }
-    monaco.editor.setTheme(theme === "dark" ? "vs-dark" : "vs");
+    const background = getCssColor("--color-editor-bg", theme === "dark" ? "#0b0f14" : "#ffffff");
+    const foreground = getCssColor("--color-editor-foreground", theme === "dark" ? "#e6edf3" : "#0f172a");
+    const lineNumber = getCssColor("--color-editor-line-number", theme === "dark" ? "#8b949e" : "#475569");
+    const selection = getCssColor("--color-editor-selection", theme === "dark" ? "#264f78" : "#bfdbfe");
+    const cursor = getCssColor("--color-editor-cursor", theme === "dark" ? "#e6edf3" : "#1f2937");
+
+    monaco.editor.defineTheme("granite-dark", {
+      base: "vs-dark",
+      inherit: true,
+      rules: [],
+      colors: {
+        "editor.background": background,
+        "editor.foreground": foreground,
+        "editorLineNumber.foreground": lineNumber,
+        "editorCursor.foreground": cursor,
+        "editor.selectionBackground": selection,
+        "editor.lineHighlightBackground": getCssColor("--color-editor-highlight", "#1f293780"),
+        "editor.inactiveSelectionBackground": getCssColor("--color-editor-inactive-selection", "#1f293733")
+      }
+    });
+
+    monaco.editor.defineTheme("granite-light", {
+      base: "vs",
+      inherit: true,
+      rules: [],
+      colors: {
+        "editor.background": background,
+        "editor.foreground": foreground,
+        "editorLineNumber.foreground": lineNumber,
+        "editorCursor.foreground": cursor,
+        "editor.selectionBackground": selection,
+        "editor.lineHighlightBackground": getCssColor("--color-editor-highlight", "#e2e8f0"),
+        "editor.inactiveSelectionBackground": getCssColor("--color-editor-inactive-selection", "#cbd5f54d")
+      }
+    });
+
+    monaco.editor.setTheme(theme === "dark" ? "granite-dark" : "granite-light");
   }, [monaco, theme]);
 
   const handleChange: OnChange = useCallback((nextValue) => {
@@ -53,14 +89,17 @@ export default function SqlEditor({ value, onChange, onRun, onExplain, theme, er
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex-1 overflow-hidden border-b border-slate-200 dark:border-slate-700">
+      <div
+        className="flex-1 overflow-hidden border-b border-slate-200 dark:border-slate-700"
+        style={{ background: "var(--color-editor-bg)" }}
+      >
         <Editor
           height="100%"
           defaultLanguage="sql"
           value={value}
           onMount={handleMount}
           onChange={handleChange}
-          theme={theme === "dark" ? "vs-dark" : "vs"}
+          theme={theme === "dark" ? "granite-dark" : "granite-light"}
           options={{
             minimap: { enabled: false },
             fontSize: 14,
@@ -84,4 +123,12 @@ function getSelectedText(editor: MonacoEditor.IStandaloneCodeEditor): string {
     return editor.getModel()?.getValueInRange(selection) ?? "";
   }
   return editor.getValue();
+}
+
+function getCssColor(variable: string, fallback: string): string {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const value = getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
+  return value || fallback;
 }

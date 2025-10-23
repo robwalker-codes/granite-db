@@ -15,7 +15,10 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["vitest/globals", "@testing-library/jest-dom"]
+    "types": ["vitest/globals", "@testing-library/jest-dom"],
+    "paths": {
+      "@tauri-apps/api/tauri": ["./node_modules/@tauri-apps/api/core"]
+    }
   },
   "include": ["src"],
   "references": [{ "path": "tsconfig.node.json" }]

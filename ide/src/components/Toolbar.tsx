@@ -11,6 +11,7 @@ interface ToolbarProps {
   onCreate(): void;
   onSelectRecent(path: string): void;
   isRunning: boolean;
+  isOpening: boolean;
   dbPath: string | null;
   recentFiles: string[];
   theme: Theme;
@@ -25,6 +26,7 @@ export default function Toolbar({
   onCreate,
   onSelectRecent,
   isRunning,
+  isOpening,
   dbPath,
   recentFiles,
   theme,
@@ -64,10 +66,14 @@ export default function Toolbar({
       <div className="flex items-center gap-3">
         <Menu as="div" className="relative inline-block text-left">
           <div>
-            <Menu.Button className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-3 py-1 text-sm font-medium text-slate-700 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-100 dark:hover:bg-slate-700">
+            <Menu.Button
+              className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-3 py-1 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-600 dark:text-slate-100 dark:hover:bg-slate-700"
+              disabled={isOpening}
+            >
               <span className="font-semibold">Database</span>
-              <span className="text-slate-500 dark:text-slate-300">
-                {dbPath ? truncatePath(dbPath) : "Open…"}
+              <span className="flex items-center gap-2 text-slate-500 dark:text-slate-300">
+                {isOpening && <span className="h-2.5 w-2.5 animate-spin rounded-full border-2 border-brand-500 border-t-transparent" aria-hidden="true" />}
+                {dbPath ? truncatePath(dbPath) : isOpening ? "Opening…" : "Open…"}
               </span>
             </Menu.Button>
           </div>
@@ -92,6 +98,7 @@ export default function Toolbar({
                         active ? "bg-slate-100 dark:bg-slate-700" : "",
                         "text-left"
                       )}
+                      disabled={isOpening}
                     >
                       File → New Database…
                     </button>
@@ -105,8 +112,10 @@ export default function Toolbar({
                       className={clsx(
                         "flex w-full items-center rounded-md px-2 py-2 text-sm",
                         active ? "bg-slate-100 dark:bg-slate-700" : "",
-                        "text-left"
+                        "text-left",
+                        isOpening && "cursor-not-allowed opacity-70"
                       )}
+                      disabled={isOpening}
                     >
                       File → Open…
                     </button>
@@ -123,9 +132,11 @@ export default function Toolbar({
                           type="button"
                           className={clsx(
                             "flex w-full items-center rounded-md px-2 py-2 text-xs text-slate-600 dark:text-slate-200",
-                            active ? "bg-slate-100 dark:bg-slate-700" : ""
+                            active ? "bg-slate-100 dark:bg-slate-700" : "",
+                            isOpening && "cursor-not-allowed opacity-60"
                           )}
                           onClick={() => onSelectRecent(item)}
+                          disabled={isOpening}
                         >
                           {truncatePath(item)}
                         </button>

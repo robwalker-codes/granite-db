@@ -1,4 +1,11 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+
+// Debounce automatic schema refreshes to avoid hammering the engine after bursts of events.
+const METADATA_REFRESH_DEBOUNCE_MS = 400;
+// Delay the spinner reset long enough for the UI to reflect the loading state even when the engine
+// responds immediately (React batches synchronous state updates otherwise).
+const SCHEMA_REFRESH_RESET_DELAY_MS = 300;
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Toaster, toast } from "react-hot-toast";
@@ -8,13 +15,136 @@ import Results from "../components/Results";
 import PlanView from "../components/PlanView";
 import Toolbar from "../components/Toolbar";
 import StatusBar from "../components/StatusBar";
+import AppErrorBoundary from "../components/framework/AppErrorBoundary";
 import { SessionProvider, useSession } from "../state/session";
-import { createDatabase, executeQuery, explainQuery, exportCsv, fetchMetadata, openDatabase, type DatabaseTable } from "../state/db";
-import type { QueryResult } from "../state/db";
+import {
+  createDatabase,
+  executeQuery,
+  explainQuery,
+  exportCsv,
+  fetchMetadata,
+  openDatabase,
+  isDdlStatement,
+  isCommitStatement,
+  type DatabaseMetadata,
+  type DatabaseTable,
+  type QueryResult
+} from "../state/db";
+import { publish, subscribe } from "../state/events/DomainEvents";
 
 function AppShell() {
-  const { state, setDbPath, setMetadata, setResult, setPlan, setEditorText, setStatus, setRunning, addRecentPath, setTheme, setActivePanel, setError } = useSession();
+  const {
+    state,
+    setDbPath,
+    setMetadata,
+    setResult,
+    setPlan,
+    setEditorText,
+    setStatus,
+    setRunning,
+    addRecentPath,
+    setTheme,
+    setActivePanel,
+    setError,
+    setOpening
+  } = useSession();
   const [search, setSearch] = useState("");
+  const [isSchemaRefreshing, setSchemaRefreshing] = useState(false);
+  const [isManualRefreshPending, setManualRefreshPending] = useState(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const schemaResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const disposedRef = useRef(false);
+  const isE2EMock = import.meta.env.VITE_ENABLE_E2E_MOCKS === "true";
+
+  useEffect(() => {
+    disposedRef.current = false;
+    return () => {
+      disposedRef.current = true;
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
+      if (schemaResetTimerRef.current) {
+        clearTimeout(schemaResetTimerRef.current);
+      }
+      if (manualResetTimerRef.current) {
+        clearTimeout(manualResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleMetadataRefresh = useCallback(
+    async (path: string): Promise<boolean> => {
+      if (!path || disposedRef.current) {
+        return false;
+      }
+      flushSync(() => {
+        setSchemaRefreshing(true);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      try {
+        const result = await fetchMetadata(path);
+        if (!result.ok) {
+          toast.error(`Could not refresh schema: ${result.error}`);
+          console.error("[Schema] Refresh failed", result.error);
+          return false;
+        }
+        if (disposedRef.current) {
+          return false;
+        }
+        setMetadata(result.value);
+        return true;
+      } finally {
+        if (schemaResetTimerRef.current) {
+          clearTimeout(schemaResetTimerRef.current);
+        }
+        schemaResetTimerRef.current = setTimeout(() => {
+          if (!disposedRef.current) {
+            flushSync(() => {
+              setSchemaRefreshing(false);
+            });
+          }
+        }, SCHEMA_REFRESH_RESET_DELAY_MS);
+      }
+    },
+    [setMetadata]
+  );
+
+  const scheduleMetadataRefresh = useCallback(
+    (path: string) => {
+      if (!path) {
+        return;
+      }
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        void handleMetadataRefresh(path);
+      }, METADATA_REFRESH_DEBOUNCE_MS);
+    },
+    [handleMetadataRefresh]
+  );
+
+  useEffect(() => {
+    if (!state.dbPath) {
+      return undefined;
+    }
+    const stopDdl = subscribe("DDL_CHANGED", (event) => {
+      if (event.db === state.dbPath) {
+        scheduleMetadataRefresh(event.db);
+      }
+    });
+    const stopCommit = subscribe("TX_COMMIT", (event) => {
+      if (event.db === state.dbPath) {
+        scheduleMetadataRefresh(event.db);
+      }
+    });
+    return () => {
+      stopDdl();
+      stopCommit();
+    };
+  }, [scheduleMetadataRefresh, state.dbPath]);
 
   const runQuery = useCallback(
     async (sql: string) => {
@@ -31,18 +161,32 @@ function AppShell() {
       setError(null);
       try {
         const result = await executeQuery(state.dbPath, trimmed);
-        setResult(result);
+        if (!result.ok) {
+          setError(result.error);
+          toast.error(result.error);
+          return;
+        }
+        const payload = result.value;
+        setResult(payload);
         setPlan(null);
         setActivePanel("results");
-        const message = result.message ?? "Query executed";
-        setStatus(message, result.durationMs, result.rows.length);
-        if (result.columns.length === 0 && result.rowsAffected) {
-          toast.success(`${message} (${result.rowsAffected} rows affected)`);
+        const message = payload.message ?? "Query executed";
+        setStatus(message, payload.durationMs, payload.rows.length);
+        if (payload.columns.length === 0 && payload.rowsAffected) {
+          const rowsAffected = payload.rowsAffected;
+          toast.success(
+            `${message} (${rowsAffected} row${rowsAffected === 1 ? "" : "s"} affected)`
+          );
         } else {
           toast.success(message);
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        if (isDdlStatement(trimmed) && state.dbPath) {
+          publish({ type: "DDL_CHANGED", db: state.dbPath });
+        } else if (isCommitStatement(trimmed) && state.dbPath) {
+          publish({ type: "TX_COMMIT", db: state.dbPath });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         setError(message);
         toast.error(message);
       } finally {
@@ -66,13 +210,18 @@ function AppShell() {
       setRunning(true);
       setError(null);
       try {
-        const plan = await explainQuery(state.dbPath, trimmed);
-        setPlan(plan);
+        const planResult = await explainQuery(state.dbPath, trimmed);
+        if (!planResult.ok) {
+          setError(planResult.error);
+          toast.error(planResult.error);
+          return;
+        }
+        setPlan(planResult.value);
         setActivePanel("plan");
         setStatus("Explain plan generated", null, null);
         toast.success("Plan ready");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         setError(message);
         toast.error(message);
       } finally {
@@ -82,7 +231,61 @@ function AppShell() {
     [setActivePanel, setError, setPlan, setRunning, setStatus, state.dbPath]
   );
 
+  const openDatabaseAtPath = useCallback(
+    async (path: string, prefix: "Opened" | "Created") => {
+      if (!path) {
+        toast.error("Database path is required.");
+        return false;
+      }
+      setOpening(true);
+      setStatus(`${prefix === "Created" ? "Creating" : "Opening"} ${path}…`, null, null);
+      setError(null);
+      try {
+        if (prefix === "Created") {
+          const createResult = await createDatabase(path);
+          if (!createResult.ok) {
+            toast.error(createResult.error);
+            setStatus(createResult.error, null, null);
+            return false;
+          }
+        }
+        const openResult = await openDatabase(path);
+        if (!openResult.ok) {
+          toast.error(openResult.error);
+          setStatus(openResult.error, null, null);
+          return false;
+        }
+        setDbPath(path);
+        setResult(null);
+        setPlan(null);
+        setMetadata(null);
+        const metadataLoaded = await handleMetadataRefresh(path);
+        if (!metadataLoaded) {
+          setStatus(`Unable to load metadata for ${path}`, null, null);
+          return false;
+        }
+        await addRecentPath(path);
+        setStatus(`${prefix} ${path}`, null, null);
+        toast.success(`${prefix} ${path}`);
+        publish({ type: "DB_OPENED", path });
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toast.error(message);
+        setStatus(message, null, null);
+        return false;
+      } finally {
+        setOpening(false);
+      }
+    },
+    [addRecentPath, handleMetadataRefresh, setDbPath, setError, setMetadata, setOpening, setPlan, setResult, setStatus]
+  );
+
   const handleOpen = useCallback(async () => {
+    if (isE2EMock) {
+      await openDatabaseAtPath("/mock/sample.gdb", "Opened");
+      return;
+    }
     const selected = await open({
       multiple: false,
       filters: [{ name: "Granite Database", extensions: ["gdb", "db"] }]
@@ -91,20 +294,14 @@ function AppShell() {
     if (!path) {
       return;
     }
-    try {
-      await openDatabase(path);
-      const metadata = await fetchMetadata(path);
-      setDbPath(path);
-      setMetadata(metadata);
-      await addRecentPath(path);
-      setStatus(`Opened ${path}`, null, null);
-      toast.success(`Opened ${path}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    }
-  }, [addRecentPath, setDbPath, setMetadata, setStatus]);
+    await openDatabaseAtPath(path, "Opened");
+  }, [isE2EMock, openDatabaseAtPath]);
 
   const handleCreateDatabase = useCallback(async () => {
+    if (isE2EMock) {
+      await openDatabaseAtPath("/mock/new-db.gdb", "Created");
+      return;
+    }
     const destination = await save({
       defaultPath: "granite-db.gdb",
       filters: [{ name: "Granite Database", extensions: ["gdb", "db"] }]
@@ -112,38 +309,14 @@ function AppShell() {
     if (!destination || Array.isArray(destination)) {
       return;
     }
-    try {
-      await createDatabase(destination);
-      await openDatabase(destination);
-      const metadata = await fetchMetadata(destination);
-      setDbPath(destination);
-      setMetadata(metadata);
-      setResult(null);
-      setPlan(null);
-      setError(null);
-      await addRecentPath(destination);
-      setStatus(`Created ${destination}`, null, null);
-      toast.success(`Created ${destination}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
-    }
-  }, [addRecentPath, setDbPath, setError, setMetadata, setPlan, setResult, setStatus]);
+    await openDatabaseAtPath(destination, "Created");
+  }, [isE2EMock, openDatabaseAtPath]);
 
   const handleSelectRecent = useCallback(
     async (path: string) => {
-      try {
-        await openDatabase(path);
-        const metadata = await fetchMetadata(path);
-        setDbPath(path);
-        setMetadata(metadata);
-        await addRecentPath(path);
-        setStatus(`Opened ${path}`, null, null);
-        toast.success(`Opened ${path}`);
-      } catch (err) {
-        toast.error(err instanceof Error ? err.message : String(err));
-      }
+      await openDatabaseAtPath(path, "Opened");
     },
-    [addRecentPath, setDbPath, setMetadata, setStatus]
+    [openDatabaseAtPath]
   );
 
   const handleSelectTable = useCallback(
@@ -165,6 +338,10 @@ function AppShell() {
       toast.error("Enter a statement to export.");
       return;
     }
+    if (isE2EMock) {
+      toast.success("CSV written (mock)");
+      return;
+    }
     const destination = await save({
       filters: [{ name: "CSV", extensions: ["csv"] }],
       defaultPath: "granite-results.csv"
@@ -174,15 +351,17 @@ function AppShell() {
     }
     setRunning(true);
     try {
-      await exportCsv(state.dbPath, sql, destination);
+      const result = await exportCsv(state.dbPath, sql, destination);
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
       setStatus(`CSV exported to ${destination}`, null, null);
       toast.success(`CSV written to ${destination}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setRunning(false);
     }
-  }, [setRunning, state.dbPath, state.editorText]);
+  }, [isE2EMock, setRunning, setStatus, state.dbPath, state.editorText]);
 
   const handleCopyResults = useCallback(async (result: QueryResult | null) => {
     if (!result) {
@@ -195,15 +374,96 @@ function AppShell() {
     toast.success("Results copied to clipboard");
   }, []);
 
-  const metadata = state.metadata;
-  const editorError = state.error;
+  const refreshSchemaNow = useCallback(async () => {
+    if (!state.dbPath) {
+      toast.error("Open a database first.");
+      return;
+    }
+    flushSync(() => {
+      setManualRefreshPending(true);
+    });
+    void (async () => {
+      try {
+        await handleMetadataRefresh(state.dbPath);
+      } finally {
+        if (manualResetTimerRef.current) {
+          clearTimeout(manualResetTimerRef.current);
+        }
+        manualResetTimerRef.current = setTimeout(() => {
+          if (!disposedRef.current) {
+            flushSync(() => {
+              setManualRefreshPending(false);
+            });
+          }
+        }, SCHEMA_REFRESH_RESET_DELAY_MS);
+      }
+    })();
+  }, [handleMetadataRefresh, state.dbPath]);
 
   const handleThemeToggle = useCallback(() => {
     setTheme(state.theme === "dark" ? "light" : "dark");
   }, [setTheme, state.theme]);
 
+  const engineBanner = useMemo(() => {
+    const info = state.engineInfo;
+    if (!info) {
+      return null;
+    }
+    if (info.exists && !info.error) {
+      return null;
+    }
+    const guidance =
+      "Build the engine (cd engine && go build ./...) or set GRANITECTL_PATH to the granitectl binary.";
+    const prefix = info.error ?? `granitectl was not found at ${info.path}.`;
+    return `${prefix} ${guidance}`;
+  }, [state.engineInfo]);
+
+  const engineVersion = state.engineInfo?.version ?? null;
+  const metadata = state.metadata;
+  const editorError = state.error;
+  const isRefreshingUi = isSchemaRefreshing || isManualRefreshPending;
+  const isBusy = state.isRunning || state.isOpening || isRefreshingUi;
+
+  useEffect(() => {
+    if (!isE2EMock || typeof window === "undefined") {
+      return undefined;
+    }
+    const globalWindow = window as Window & {
+      __graniteTest?: {
+        setEditor(value: string): void;
+        refreshMetadata(): Promise<boolean>;
+        getMetadata(): DatabaseMetadata | null;
+      };
+    };
+    const api = {
+      setEditor(value: string) {
+        setEditorText(value);
+      },
+      refreshMetadata() {
+        if (state.dbPath) {
+          return handleMetadataRefresh(state.dbPath);
+        }
+        return Promise.resolve(false);
+      },
+      getMetadata() {
+        return state.metadata;
+      }
+    };
+    globalWindow.__graniteTest = api;
+    return () => {
+      if (globalWindow.__graniteTest === api) {
+        delete globalWindow.__graniteTest;
+      }
+    };
+  }, [handleMetadataRefresh, isE2EMock, setEditorText, state.dbPath, state.metadata]);
+
   return (
     <div className="flex h-screen flex-col">
+      {engineBanner && (
+        <div className="border-b border-amber-300 bg-amber-100 px-4 py-2 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-900/40 dark:text-amber-100">
+          {engineBanner}
+        </div>
+      )}
       <Toolbar
         onRun={() => runQuery(state.editorText)}
         onExplain={() => explain(state.editorText)}
@@ -212,13 +472,21 @@ function AppShell() {
         onCreate={handleCreateDatabase}
         onSelectRecent={handleSelectRecent}
         isRunning={state.isRunning}
+        isOpening={state.isOpening}
         dbPath={state.dbPath}
         recentFiles={state.recentFiles}
         theme={state.theme}
         onToggleTheme={handleThemeToggle}
       />
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar metadata={metadata} search={search} onSearchChange={setSearch} onSelectTable={handleSelectTable} />
+        <Sidebar
+          metadata={metadata}
+          search={search}
+          onSearchChange={setSearch}
+          onSelectTable={handleSelectTable}
+          onRefresh={refreshSchemaNow}
+          refreshing={isRefreshingUi}
+        />
         <main className="flex flex-1 flex-col">
           <div className="grid h-full grid-rows-[minmax(0,1fr)_minmax(0,1fr)]">
             <SqlEditor
@@ -254,6 +522,8 @@ function AppShell() {
         rowCount={state.rowCount}
         dbPath={state.dbPath}
         theme={state.theme}
+        isBusy={isBusy}
+        engineVersion={engineVersion}
       />
       <Toaster position="bottom-right" toastOptions={{ duration: 3000 }} />
     </div>
@@ -262,8 +532,10 @@ function AppShell() {
 
 export default function App() {
   return (
-    <SessionProvider>
-      <AppShell />
-    </SessionProvider>
+    <AppErrorBoundary>
+      <SessionProvider>
+        <AppShell />
+      </SessionProvider>
+    </AppErrorBoundary>
   );
 }

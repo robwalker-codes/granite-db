@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "test": "vitest",
+    "e2e": "playwright test",
     "tauri": "tauri",
     "tauri:dev": "set GRANITECTL_PATH=..\\..\\engine\\granitectl.exe && tauri dev",
     "tauri:build": "set GRANITECTL_PATH=..\\..\\engine\\granitectl.exe && tauri build"
@@ -32,6 +33,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@playwright/test": "^1.45.0",
     "@testing-library/jest-dom": "^6.1.4",
     "@testing-library/react": "^14.1.2",
     "@types/react": "^18.2.37",
